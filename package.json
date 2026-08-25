@@ -1,0 +1,64 @@
+{
+  "name": "@ecosy/orm",
+  "version": "1.0.0",
+  "description": "A lightweight ORM with DataSource and Repository pattern for PostgreSQL",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "unpkg": "./dist/ecosy-orm.umd.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "clean": "rimraf dist",
+    "build": "eslint src/ && rollup -c",
+    "prepublishOnly": "yarn clean && yarn build",
+    "dev": "rollup -c --watch",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "format": "prettier --write src/",
+    "format:check": "prettier --check src/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/material-atomic/ecosy-orm.git"
+  },
+  "author": "material-atomic",
+  "peerDependencies": {
+    "pg": "^8.11.0"
+  },
+  "dependencies": {
+    "@ecosy/core": "^0.4.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@rollup/plugin-terser": "^1.0.0",
+    "@rollup/plugin-typescript": "^12.3.0",
+    "@types/node": "^26.2.0",
+    "@types/pg": "^8.11.0",
+    "@typescript-eslint/eslint-plugin": "^8.67.0",
+    "@typescript-eslint/parser": "^8.67.0",
+    "eslint": "^10.9.0",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.6",
+    "prettier": "^3.9.6",
+    "rimraf": "^6.1.3",
+    "rollup": "^4.62.5",
+    "server-only": "^0.0.1",
+    "tslib": "^2.8.1",
+    "typescript": "6"
+  }
+}
