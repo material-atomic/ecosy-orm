@@ -205,6 +205,10 @@ export class SchemaBuilder {
         const cols = idx.columns.map(c => `"${schema.columns[c]?.name || c}"`).join(", ");
         await this.connection.query(`CREATE ${unique}INDEX "${idx.name}" ON "${entityName}" (${cols})`);
       }
+      
+      for (const chk of (schema.checks || [])) {
+        await this.connection.query(`ALTER TABLE "${entityName}" ADD CONSTRAINT "${chk.name}" CHECK (${chk.expression})`);
+      }
       return;
     }
 
@@ -261,6 +265,33 @@ export class SchemaBuilder {
           console.log(`[DB] Recreating index ${idx.name} on ${entityName} due to changes...`);
           await this.connection.query(`DROP INDEX "${idx.name}"`);
           await this.connection.query(`CREATE ${unique}INDEX "${idx.name}" ON "${entityName}" (${cols})`);
+        }
+      }
+    }
+
+    const checkQuery = await this.connection.query(`
+      SELECT conname, pg_get_constraintdef(oid) as condef
+      FROM pg_constraint
+      WHERE conrelid = $1::regclass AND contype = 'c'
+    `, [entityName]);
+    const existingChecks = checkQuery.rows.reduce((acc: any, row: any) => {
+      acc[row.conname] = row.condef;
+      return acc;
+    }, {});
+
+    for (const chk of (schema.checks || [])) {
+      if (!existingChecks[chk.name]) {
+        await this.connection.query(`ALTER TABLE "${entityName}" ADD CONSTRAINT "${chk.name}" CHECK (${chk.expression})`);
+      } else {
+        const currentDef: string = existingChecks[chk.name];
+        // Postgres rewrites the expression, so we check if all words/identifiers in our expression appear in the db's expression
+        const tokens = chk.expression.match(/[a-zA-Z0-9_]{2,}/g) || [];
+        const match = tokens.every(t => currentDef.includes(t));
+        
+        if (!match) {
+          console.log(`[DB] Recreating check constraint ${chk.name} on ${entityName} due to changes...`);
+          await this.connection.query(`ALTER TABLE "${entityName}" DROP CONSTRAINT "${chk.name}"`);
+          await this.connection.query(`ALTER TABLE "${entityName}" ADD CONSTRAINT "${chk.name}" CHECK (${chk.expression})`);
         }
       }
     }

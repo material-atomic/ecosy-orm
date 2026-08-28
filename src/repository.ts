@@ -83,9 +83,15 @@ export interface IndexOptions {
   unique?: boolean;
 }
 
+export interface CheckOptions {
+  name: string;
+  expression: string;
+}
+
 export interface SchemaOptions {
   columns: Record<string, ColumnOptions>;
   indexes?: readonly IndexOptions[];
+  checks?: readonly CheckOptions[];
 }
 
 export abstract class Repository<Entity extends BaseEntity> {

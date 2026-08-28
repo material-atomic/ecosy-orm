@@ -8,25 +8,35 @@ import type { Entity as BaseEntity, EntityConstructor } from "./entity";
 import { Repository } from "./repository";
 
 export class DataSource {
-  private static pool: Pool;
   private static _configs: PoolConfig;
   private static _entities: EntityConstructor<any>[] = [];
 
   constructor(configs?: PoolConfig) {
+    console.log("[DataSource] constructor() called.");
     if (configs) {
-      if (!DataSource.pool) {
+      const g = globalThis as any;
+      if (!g.__ECOSY_ORM_POOL) {
+        console.log("[DataSource] Creating new Pool...");
         DataSource._configs = freeze(configs) as PoolConfig;
-        DataSource.pool = new Pool(DataSource._configs);
+        g.__ECOSY_ORM_POOL = new Pool(DataSource._configs);
+      } else {
+        console.log("[DataSource] Pool already exists!");
       }
     }
   }
 
+  static get pool(): Pool {
+    return (globalThis as any).__ECOSY_ORM_POOL;
+  }
+
   static entities(entities: EntityConstructor<any>[]) {
+    console.log("[DataSource] entities() called with", entities.map(e => e.name || e.entityName));
     this._entities = Array.from(new Set([...entities]));
     return this;
   }
 
   static async initialize(configs: PoolConfig) {
+    console.log("[DataSource] initialize() called with configs:", Object.keys(configs));
     const conn = new DataSource(configs);
 
     // Initialize entities
@@ -58,6 +68,7 @@ export class DataSource {
 
   async query(sql: string, params?: unknown[]) {
     if (!DataSource.pool) {
+      console.error("[DataSource] query() failed: DataSource.pool is undefined. Was initialize() called in this isolate?");
       throw new Error("DataSource has not been initialized. Please call DataSource.initialize() first.");
     }
     return DataSource.pool.query(sql, params);

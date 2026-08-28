@@ -6,7 +6,6 @@
   "publishConfig": {
     "access": "public"
   },
-  "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "unpkg": "./dist/ecosy-orm.umd.js",
