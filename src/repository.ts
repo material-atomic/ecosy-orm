@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { Entity as BaseEntity } from "./entity";
 import { DataSource } from "./data-source";
+import type { Queryable } from "./drivers/types";
 import { QueryBuilder, SchemaBuilder } from "./query-builder";
 
 export type FindCondition<T> =
@@ -100,7 +101,9 @@ export abstract class Repository<Entity extends BaseEntity> {
   protected entityClass: new () => Entity;
   protected queryBuilder: QueryBuilder<Entity>;
   protected schemaBuilder: SchemaBuilder;
-  protected connection: DataSource;
+  /* Typed as Queryable, not DataSource: `using()` swaps in a Transaction, and
+     everything here needs only `query`. */
+  protected connection: Queryable;
 
   constructor(
     entityFactory: { new (): Entity, entityName: string, schema: SchemaOptions }
@@ -111,6 +114,30 @@ export abstract class Repository<Entity extends BaseEntity> {
     this.schema = entityFactory.schema;
     this.queryBuilder = new QueryBuilder<Entity>(this.entityName, this.schema);
     this.schemaBuilder = new SchemaBuilder(this.connection);
+  }
+
+  /**
+   * The same repository, bound to a transaction.
+   *
+   * Returns a view rather than mutating: the original keeps running on the
+   * pool, so a repository shared across requests cannot be dragged into one
+   * request's transaction.
+   *
+   * @example
+   * await DataSource.transaction(async (tx) => {
+   *   await files.using(tx).delete({ projectId });
+   *   await projects.using(tx).delete({ id: projectId });
+   * });
+   *
+   * @param tx The transaction to run on.
+   * @returns A repository of the same type whose statements go to `tx`.
+   */
+  using(tx: Queryable): this {
+    /* The receiver becomes the prototype, so subclass methods and every other
+       field are inherited and only `connection` is shadowed. */
+    const bound = Object.create(this) as this;
+    (bound as unknown as { connection: Queryable }).connection = tx;
+    return bound;
   }
 
   getPrimaryKeyField(): string {

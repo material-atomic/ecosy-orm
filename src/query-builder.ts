@@ -2,6 +2,9 @@
 import { Serialize } from "@ecosy/core/serialize";
 import type { FindOptions, FindWhereOptions, ObjectWhere, SchemaOptions } from "./repository";
 import type { Entity as BaseEntity } from "./entity";
+import type { Dialect, Queryable } from "./drivers/types";
+import { currentDialect } from "./drivers/current";
+
 
 export class QueryBuilder<Entity extends BaseEntity> {
   private _sqls = {
@@ -12,20 +15,40 @@ export class QueryBuilder<Entity extends BaseEntity> {
     count: "SELECT COUNT(1) as count FROM {entity}",
   };
 
-  constructor(public entityName: string, public schema: SchemaOptions) {}
+  constructor(
+    public entityName: string,
+    public schema: SchemaOptions,
+    /** Defaults to the installed driver's dialect. */
+    private dialect: Dialect = currentDialect(),
+  ) {}
+
+  /** Quotes an identifier the way this engine expects. */
+  private q(identifier: string) {
+    return this.dialect.quote(identifier);
+  }
 
   private dbCol(tsKey: string): string {
     return this.schema.columns[tsKey]?.name || tsKey;
   }
 
   private withEntity(tsKey: string) {
-    return `"${this.entityName}"."${this.dbCol(tsKey)}"`;
+    return `${this.q(this.entityName)}.${this.q(this.dbCol(tsKey))}`;
   }
 
   private getQueryColumns() {
     return Object.keys(this.schema.columns).map((tsKey) => {
-      return `"${this.entityName}"."${this.dbCol(tsKey)}" AS "${tsKey}"`;
+      return `${this.q(this.entityName)}.${this.q(this.dbCol(tsKey))} AS ${this.q(tsKey)}`;
     }).join(", ");
+  }
+
+  /**
+   * The RETURNING tail, or nothing on an engine without it.
+   *
+   * A caller that needs the row back has to read it separately there; saying
+   * RETURNING to MySQL is a syntax error rather than a missing field.
+   */
+  private returning() {
+    return this.dialect.supportsReturning ? ` RETURNING ${this.getQueryColumns()}` : "";
   }
 
   private buildWhereSql(where: FindWhereOptions<Entity>, params: any[]): string {
@@ -50,19 +73,19 @@ export class QueryBuilder<Entity extends BaseEntity> {
         const v = value as any;
         if (v.type === "NOT") {
           params.push(v.value);
-          return `${this.withEntity(tsKey)} != $${params.length}`;
+          return `${this.withEntity(tsKey)} != ${this.dialect.placeholder(params.length)}`;
         }
         if (v.type === "LIKE") {
           params.push(v.value);
-          return `${this.withEntity(tsKey)} LIKE $${params.length}`;
+          return `${this.withEntity(tsKey)} LIKE ${this.dialect.placeholder(params.length)}`;
         }
         if (v.type === "BETWEEN") {
           params.push(v.value[0], v.value[1]);
-          return `${this.withEntity(tsKey)} BETWEEN $${params.length - 1} AND $${params.length}`;
+          return `${this.withEntity(tsKey)} BETWEEN ${this.dialect.placeholder(params.length - 1)} AND ${this.dialect.placeholder(params.length)}`;
         }
       }
       params.push(value);
-      return `${this.withEntity(tsKey)} = $${params.length}`;
+      return `${this.withEntity(tsKey)} = ${this.dialect.placeholder(params.length)}`;
     });
 
     return conditions.length ? conditions.join(" AND ") : "";
@@ -99,15 +122,15 @@ export class QueryBuilder<Entity extends BaseEntity> {
     const values = arr.map(obj => {
       return `(${tsKeys.map(c => {
         params.push((obj as any)[c]);
-        return `$${params.length}`;
+        return `${this.dialect.placeholder(params.length)}`;
       }).join(", ")})`;
     }).join(", ");
     
     const sql = Serialize.interpolate(this._sqls.insert, {
       entity: this.entityName,
-      columns: tsKeys.map(c => `"${this.dbCol(c)}"`).join(", "),
+      columns: tsKeys.map(c => this.q(this.dbCol(c))).join(", "),
       values
-    }) + ` RETURNING ${this.getQueryColumns()}`;
+    }) + this.returning();
 
     return { sql, params };
   }
@@ -116,7 +139,7 @@ export class QueryBuilder<Entity extends BaseEntity> {
     const params: any[] = [];
     const assignments = Object.entries(data).map(([tsKey, v]) => {
       params.push(v);
-      return `"${this.dbCol(tsKey)}" = $${params.length}`;
+      return `${this.q(this.dbCol(tsKey))} = ${this.dialect.placeholder(params.length)}`;
     }).join(", ");
     const condition = this.buildWhereSql(where, params);
     
@@ -152,147 +175,149 @@ export class QueryBuilder<Entity extends BaseEntity> {
     const values = arr.map(obj => {
       return `(${tsKeys.map(c => {
         params.push((obj as any)[c]);
-        return `$${params.length}`;
+        return `${this.dialect.placeholder(params.length)}`;
       }).join(", ")})`;
     }).join(", ");
     
     const insertSql = Serialize.interpolate(this._sqls.insert, {
       entity: this.entityName,
-      columns: tsKeys.map(c => `"${this.dbCol(c)}"`).join(", "),
+      columns: tsKeys.map(c => this.q(this.dbCol(c))).join(", "),
       values
     });
 
     const dbConflictColumns = conflictColumns.map(c => this.dbCol(c));
 
-    const assignments = tsKeys
+    const updateColumns = tsKeys
       .filter(c => !conflictColumns.includes(c))
-      .map(c => `"${this.dbCol(c)}" = EXCLUDED."${this.dbCol(c)}"`)
-      .join(", ");
+      .map(c => this.dbCol(c));
 
-    const sql = `${insertSql} ON CONFLICT (${dbConflictColumns.map(c => `"${c}"`).join(", ")}) DO UPDATE SET ${assignments} RETURNING ${this.getQueryColumns()}`;
+    const sql = `${insertSql} ${this.dialect.upsertClause(dbConflictColumns, updateColumns)}${this.returning()}`;
     
     return { sql, params };
   }
 }
 
 export class SchemaBuilder {
-  constructor(private connection: any) {}
+  /**
+   * @param connection Where to run the statements.
+   * @param dialect How to phrase them. Every engine-specific query — does this
+   * table exist, what indexes does it have — now belongs to the dialect, so
+   * this class contains no SQL that only one database understands.
+   */
+  constructor(
+    private connection: Queryable,
+    /** Defaults to the installed driver's dialect. */
+    private dialect: Dialect = currentDialect(),
+  ) {}
+
+  private columnDefinition(opt: any, withPrimaryKey: boolean) {
+    let def = `${this.dialect.quote(opt.name)} ${opt.type}`;
+    if (withPrimaryKey && opt.primaryKey) def += " PRIMARY KEY";
+    if (opt.unique) def += " UNIQUE";
+    if (opt.notNull) def += " NOT NULL";
+    if (opt.default) def += ` DEFAULT ${opt.default}`;
+    if (opt.references) def += ` REFERENCES ${opt.references}`;
+    return def;
+  }
+
+  private indexStatement(entityName: string, schema: SchemaOptions, idx: any) {
+    const unique = idx.unique ? "UNIQUE " : "";
+    const cols = idx.columns
+      .map((c: string) => this.dialect.quote(schema.columns[c]?.name || c))
+      .join(", ");
+    return `CREATE ${unique}INDEX ${this.dialect.quote(idx.name)} ON ${this.dialect.quote(entityName)} (${cols})`;
+  }
+
+  private checkStatement(entityName: string, chk: any) {
+    return `ALTER TABLE ${this.dialect.quote(entityName)} ADD CONSTRAINT ${this.dialect.quote(chk.name)} CHECK (${chk.expression})`;
+  }
 
   async syncSchema(entityName: string, schema: SchemaOptions) {
-    const tableCheck = await this.connection.query(`
-      SELECT EXISTS (
-        SELECT FROM information_schema.tables 
-        WHERE table_name = $1
-      )
-    `, [entityName]);
-    const tableExists = tableCheck.rows[0].exists;
+    const table = this.dialect.quote(entityName);
 
-    if (!tableExists) {
-      const columnsSql = Object.entries(schema.columns).map(([, opt]) => {
-        let def = `"${opt.name}" ${opt.type}`;
-        if (opt.primaryKey) def += " PRIMARY KEY";
-        if (opt.unique) def += " UNIQUE";
-        if (opt.notNull) def += " NOT NULL";
-        if (opt.default) def += ` DEFAULT ${opt.default}`;
-        if (opt.references) def += ` REFERENCES ${opt.references}`;
-        return def;
-      }).join(",\n  ");
+    if (!(await this.dialect.tableExists(this.connection, entityName))) {
+      const columnsSql = Object.entries(schema.columns)
+        .map(([, opt]) => this.columnDefinition(opt, true))
+        .join(",\n  ");
 
-      await this.connection.query(`CREATE TABLE "${entityName}" (\n  ${columnsSql}\n)`);
-      
-      for (const idx of (schema.indexes || [])) {
-        const unique = idx.unique ? "UNIQUE " : "";
-        const cols = idx.columns.map(c => `"${schema.columns[c]?.name || c}"`).join(", ");
-        await this.connection.query(`CREATE ${unique}INDEX "${idx.name}" ON "${entityName}" (${cols})`);
+      await this.connection.query(`CREATE TABLE ${table} (\n  ${columnsSql}\n)`);
+
+      for (const idx of schema.indexes || []) {
+        await this.connection.query(this.indexStatement(entityName, schema, idx));
       }
-      
-      for (const chk of (schema.checks || [])) {
-        await this.connection.query(`ALTER TABLE "${entityName}" ADD CONSTRAINT "${chk.name}" CHECK (${chk.expression})`);
+
+      for (const chk of schema.checks || []) {
+        await this.connection.query(this.checkStatement(entityName, chk));
       }
+
       return;
     }
 
-    const columnsQuery = await this.connection.query(`
-      SELECT column_name, is_nullable 
-      FROM information_schema.columns 
-      WHERE table_name = $1
-    `, [entityName]);
-    const existingCols = columnsQuery.rows.reduce((acc: any, row: any) => {
-      acc[row.column_name] = row;
-      return acc;
-    }, {});
+    const existingCols = Object.fromEntries(
+      (await this.dialect.listColumns(this.connection, entityName)).map((c) => [c.name, c]),
+    );
 
     for (const [, opt] of Object.entries(schema.columns)) {
       const dbCol = opt.name as string;
+
       if (!existingCols[dbCol]) {
-        let def = `"${dbCol}" ${opt.type}`;
-        if (opt.unique) def += " UNIQUE";
-        if (opt.notNull) def += " NOT NULL";
-        if (opt.default) def += ` DEFAULT ${opt.default}`;
-        if (opt.references) def += ` REFERENCES ${opt.references}`;
-        await this.connection.query(`ALTER TABLE "${entityName}" ADD COLUMN ${def}`);
-      } else {
-        const isNotNull = existingCols[dbCol].is_nullable === 'NO';
-        if (opt.notNull && !isNotNull && !opt.primaryKey) {
-          await this.connection.query(`ALTER TABLE "${entityName}" ALTER COLUMN "${dbCol}" SET NOT NULL`);
-        } else if (!opt.notNull && isNotNull && !opt.primaryKey) {
-          await this.connection.query(`ALTER TABLE "${entityName}" ALTER COLUMN "${dbCol}" DROP NOT NULL`);
-        }
+        await this.connection.query(
+          `ALTER TABLE ${table} ADD COLUMN ${this.columnDefinition(opt, false)}`,
+        );
+        continue;
+      }
+
+      /* A primary key is not null by definition, and saying so again is an
+         error on some engines. */
+      if (opt.primaryKey) continue;
+
+      const isNotNull = !existingCols[dbCol].nullable;
+      if (Boolean(opt.notNull) !== isNotNull) {
+        await this.connection.query(
+          this.dialect.alterNullable(entityName, dbCol, opt.type as string, Boolean(opt.notNull)),
+        );
       }
     }
 
-    const indexQuery = await this.connection.query(`
-      SELECT indexname, indexdef FROM pg_indexes WHERE tablename = $1
-    `, [entityName]);
-    const existingIndexes = indexQuery.rows.reduce((acc: any, row: any) => {
-      acc[row.indexname] = row.indexdef;
-      return acc;
-    }, {});
+    const existingIndexes = await this.dialect.listIndexes(this.connection, entityName);
 
-    for (const idx of (schema.indexes || [])) {
-      const unique = idx.unique ? "UNIQUE " : "";
-      const cols = idx.columns.map(c => `"${schema.columns[c]?.name || c}"`).join(", ");
-      
+    for (const idx of schema.indexes || []) {
+      const create = this.indexStatement(entityName, schema, idx);
+
       if (!existingIndexes[idx.name]) {
-        await this.connection.query(`CREATE ${unique}INDEX "${idx.name}" ON "${entityName}" (${cols})`);
-      } else {
-        const currentDef: string = existingIndexes[idx.name];
-        const mappedCols = idx.columns.map(c => schema.columns[c]?.name || c);
-        const colsMatch = mappedCols.every(c => currentDef.includes(c));
-        const uniqueMatch = idx.unique ? currentDef.includes("UNIQUE") : !currentDef.includes("UNIQUE");
-        
-        if (!colsMatch || !uniqueMatch) {
-          console.log(`[DB] Recreating index ${idx.name} on ${entityName} due to changes...`);
-          await this.connection.query(`DROP INDEX "${idx.name}"`);
-          await this.connection.query(`CREATE ${unique}INDEX "${idx.name}" ON "${entityName}" (${cols})`);
-        }
+        await this.connection.query(create);
+        continue;
+      }
+
+      const currentDef = existingIndexes[idx.name];
+      const mappedCols = idx.columns.map((c: string) => schema.columns[c]?.name || c);
+      const colsMatch = mappedCols.every((c: string) => currentDef.includes(c));
+      const uniqueMatch = idx.unique ? currentDef.includes("UNIQUE") : !currentDef.includes("UNIQUE");
+
+      if (!colsMatch || !uniqueMatch) {
+        console.log(`[DB] Recreating index ${idx.name} on ${entityName} due to changes...`);
+        await this.connection.query(`DROP INDEX ${this.dialect.quote(idx.name)}`);
+        await this.connection.query(create);
       }
     }
 
-    const checkQuery = await this.connection.query(`
-      SELECT conname, pg_get_constraintdef(oid) as condef
-      FROM pg_constraint
-      WHERE conrelid = $1::regclass AND contype = 'c'
-    `, [entityName]);
-    const existingChecks = checkQuery.rows.reduce((acc: any, row: any) => {
-      acc[row.conname] = row.condef;
-      return acc;
-    }, {});
+    const existingChecks = await this.dialect.listChecks(this.connection, entityName);
 
-    for (const chk of (schema.checks || [])) {
+    for (const chk of schema.checks || []) {
       if (!existingChecks[chk.name]) {
-        await this.connection.query(`ALTER TABLE "${entityName}" ADD CONSTRAINT "${chk.name}" CHECK (${chk.expression})`);
-      } else {
-        const currentDef: string = existingChecks[chk.name];
-        // Postgres rewrites the expression, so we check if all words/identifiers in our expression appear in the db's expression
-        const tokens = chk.expression.match(/[a-zA-Z0-9_]{2,}/g) || [];
-        const match = tokens.every(t => currentDef.includes(t));
-        
-        if (!match) {
-          console.log(`[DB] Recreating check constraint ${chk.name} on ${entityName} due to changes...`);
-          await this.connection.query(`ALTER TABLE "${entityName}" DROP CONSTRAINT "${chk.name}"`);
-          await this.connection.query(`ALTER TABLE "${entityName}" ADD CONSTRAINT "${chk.name}" CHECK (${chk.expression})`);
-        }
+        await this.connection.query(this.checkStatement(entityName, chk));
+        continue;
+      }
+
+      /* The server rewrites a check expression, so it is compared by the
+         identifiers it mentions rather than character by character. */
+      const tokens = chk.expression.match(/[a-zA-Z0-9_]{2,}/g) || [];
+      if (!tokens.every((t: string) => existingChecks[chk.name].includes(t))) {
+        console.log(`[DB] Recreating check constraint ${chk.name} on ${entityName} due to changes...`);
+        await this.connection.query(
+          `ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(chk.name)}`,
+        );
+        await this.connection.query(this.checkStatement(entityName, chk));
       }
     }
   }
