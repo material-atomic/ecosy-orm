@@ -1,8 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import "server-only";
 
-import type { Entity as BaseEntity, EntityConstructor } from "./entity";
-import { Repository } from "./repository";
+import type { EntityConstructor } from "./entity";
 import { Transaction } from "./transaction";
 import type { Driver, QueryResultLike } from "./drivers/types";
 import { currentDriver, setDriver } from "./drivers/current";
@@ -130,10 +129,5 @@ export class DataSource {
   transaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>;
   transaction<T>(fn?: (tx: Transaction) => Promise<T>) {
     return fn ? DataSource.transaction(fn) : DataSource.transaction();
-  }
-
-  createRepository<T extends BaseEntity>(EntityClass: EntityConstructor<T>): Repository<T> {
-    class DynamicRepository extends Repository<T> {}
-    return new DynamicRepository(EntityClass);
   }
 }

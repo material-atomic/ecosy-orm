@@ -1,6 +1,7 @@
 import typescript from "@rollup/plugin-typescript";
 import terser from "@rollup/plugin-terser";
 import path from "path";
+import { builtinModules } from "module";
 import { glob } from "glob";
 
 // Get all TypeScript files in src, excluding test files
@@ -17,11 +18,33 @@ const input = inputFiles.reduce((acc, file) => {
 }, {});
 
 // Base external packages
+//
+// Node's own modules are on the list because this package runs on a server and
+// imports them directly — `fs/promises` and `path` in the migration helpers.
+// Without them Rollup tries to resolve the import, fails, warns, and leaves the
+// require in place anyway: the build works and reports as if it did not.
 const external = [
   "pg",
   "server-only",
-  /^@ecosy\/.*/
+  /^@ecosy\/.*/,
+  ...builtinModules,
+  ...builtinModules.map((name) => `node:${name}`),
+  /^node:/,
 ];
+
+/**
+ * Warnings this build is not going to act on.
+ *
+ * EMPTY_BUNDLE fires for `optional` and `drivers/types`, which hold nothing
+ * but types. They are still inputs on purpose — that is what makes Rollup's
+ * TypeScript plugin emit their `.d.ts`, and `index.d.ts` re-exports both — so
+ * an empty `.js` beside each is the cost of shipping the declarations, not a
+ * mistake to fix.
+ */
+function onwarn(warning, warn) {
+  if (warning.code === "EMPTY_BUNDLE") return;
+  warn(warning);
+}
 
 // Minification configuration
 const minifyOptions = {
@@ -37,6 +60,7 @@ const minifyOptions = {
 const cjsConfig = {
   input,
   external,
+  onwarn,
   output: {
     dir: "dist",
     format: "cjs",
@@ -62,6 +86,7 @@ const cjsConfig = {
 const esmConfig = {
   input,
   external,
+  onwarn,
   output: {
     dir: "dist",
     format: "esm",
@@ -85,24 +110,16 @@ const esmConfig = {
   ],
 };
 
-// UMD build (Standalone for browsers)
-const umdConfig = {
-  input: "src/index.ts",
-  output: {
-    file: "dist/ecosy-orm.umd.js",
-    format: "umd",
-    name: "EcosyOrm",
-    sourcemap: true,
-    exports: "named",
-  },
-  plugins: [
-    typescript({
-      tsconfig: "./tsconfig.json",
-      declaration: false,
-      rootDir: "src",
-    }),
-    terser(minifyOptions),
-  ],
-};
+/* There is no browser build.
+ *
+ * There was a UMD one, and it could never have run: `data-source.ts` and
+ * `transaction.ts` import `server-only`, `migration.ts` imports `fs/promises`
+ * and `path`, and Rollup was shimming all of it into globals named `fs` and
+ * `path`. It produced a file, the file was broken, and nothing referenced it —
+ * `main`, `module` and `exports` all point at dist/index.
+ *
+ * An ORM that opens sockets to Postgres has no browser story. Shipping a
+ * bundle that claims otherwise is worse than shipping none.
+ */
 
-export default [cjsConfig, esmConfig, umdConfig];
+export default [cjsConfig, esmConfig];

@@ -75,3 +75,7 @@ export const Flexible = Entity.create("flexible", {
 
 /* The helper is exported, so a project can type its own layer the same way. */
 export type UserPatch = PartialInput<User>;
+
+/* Moved off DataSource to break the data-source ↔ repository cycle. */
+import { createRepository } from "../src/index";
+export const dynamic = createRepository(UserEntity);

@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { PartialInput } from "./optional";
-import type { Entity as BaseEntity } from "./entity";
+import type { Entity as BaseEntity, EntityConstructor } from "./entity";
 import { DataSource } from "./data-source";
 import type { Queryable } from "./drivers/types";
 import { QueryBuilder, SchemaBuilder } from "./query-builder";
@@ -66,6 +66,24 @@ export interface FindOptions<Entity extends BaseEntity> {
  * const active: FindWhereOptions<User> = And({ status: "active" });
  * ```
  */
+/**
+ * A repository for an entity that has no class of its own.
+ *
+ * Lives here rather than on `DataSource` as it used to. `DataSource` needed
+ * `Repository` as a value only for this, while `Repository` needs
+ * `DataSource` for every query it runs — so the one method made the two
+ * modules import each other, and a cycle in a package whose entry re-exports
+ * both is a class that is `undefined` at the moment the other is evaluated.
+ * One direction remains: repository → data-source.
+ */
+export function createRepository<Entity extends BaseEntity>(
+  EntityClass: EntityConstructor<Entity>,
+): Repository<Entity> {
+  class DynamicRepository extends Repository<Entity> {}
+
+  return new DynamicRepository(EntityClass);
+}
+
 export function And<Entity extends BaseEntity>(
   ...conditions: NoInfer<FindWhereOptions<Entity>>[]
 ): AndCondition<Entity> {
