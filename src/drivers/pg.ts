@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { PoolConfig } from "pg";
+import type { PartialInput } from "../optional";
 import type {
   ColumnInfo,
   Dialect,
@@ -81,8 +82,14 @@ const dialect: Dialect = {
  * const driver = PgDriver({ host: "localhost", user: "app", database: "app" });
  *
  * @param config Passed to `new Pool()` untouched.
+ *
+ * Typed as {@link PartialInput} rather than `PoolConfig` itself: a config is
+ * usually assembled from the environment, where every value is
+ * `string | undefined`, and `pg`'s own optional properties refuse that under
+ * `exactOptionalPropertyTypes`. `pg` is not ours to change, so the relaxation
+ * happens on the way in.
  */
-export function PgDriver(config: PoolConfig): Driver {
+export function PgDriver(config: PartialInput<PoolConfig>): Driver {
   /* Held on globalThis under a Symbol so a hot reload reuses the pool instead
      of opening a second one and quietly doubling the connection count. */
   const POOL = Symbol.for("@ecosy/orm:pg-pool");
@@ -103,7 +110,7 @@ export function PgDriver(config: PoolConfig): Driver {
       if (global[POOL]) return;
 
       const { Pool } = await import("pg");
-      global[POOL] = new Pool(config);
+      global[POOL] = new Pool(config as PoolConfig);
     },
 
     async end() {

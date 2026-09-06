@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import type { PartialInput } from "./optional";
 import { Serialize } from "@ecosy/core/serialize";
 import type { FindOptions, FindWhereOptions, ObjectWhere, SchemaOptions } from "./repository";
 import type { Entity as BaseEntity } from "./entity";
@@ -115,7 +116,7 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return { sql, params };
   }
 
-  buildInsert(arr: Partial<Entity>[]): { sql: string, params: any[] } {
+  buildInsert(arr: PartialInput<Entity>[]): { sql: string, params: any[] } {
     if (!arr.length) return { sql: "", params: [] };
     const tsKeys = Object.keys(arr[0]);
     const params: any[] = [];
@@ -135,7 +136,7 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return { sql, params };
   }
 
-  buildUpdate(where: FindWhereOptions<Entity>, data: Partial<Entity>): { sql: string, params: any[] } {
+  buildUpdate(where: FindWhereOptions<Entity>, data: PartialInput<Entity>): { sql: string, params: any[] } {
     const params: any[] = [];
     const assignments = Object.entries(data).map(([tsKey, v]) => {
       params.push(v);
@@ -168,7 +169,7 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return { sql, params };
   }
 
-  buildUpsert(arr: Partial<Entity>[], conflictColumns: string[]): { sql: string, params: any[] } {
+  buildUpsert(arr: PartialInput<Entity>[], conflictColumns: string[]): { sql: string, params: any[] } {
     if (!arr.length) return { sql: "", params: [] };
     const tsKeys = Object.keys(arr[0]);
     const params: any[] = [];

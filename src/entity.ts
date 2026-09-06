@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import type { PartialInput } from "./optional";
 import type { Repository, FindWhereOptions, ColumnOptions, IndexOptions } from "./repository";
 
 export type InferColumnType<T extends string> = 
@@ -34,7 +35,7 @@ export abstract class Entity {
    */
   static hydrate<T extends Entity>(
     this: new () => T,
-    data: Partial<T>,
+    data: PartialInput<T>,
     repo: Repository<any>
   ): T {
     const instance = new this();

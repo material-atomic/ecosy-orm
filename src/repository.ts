@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import type { PartialInput } from "./optional";
 import type { Entity as BaseEntity } from "./entity";
 import { DataSource } from "./data-source";
 import type { Queryable } from "./drivers/types";
@@ -31,18 +32,53 @@ export type FindWhereOptions<Entity extends BaseEntity> =
   | FindWhereOptions<Entity>[];
 
 export interface FindOptions<Entity extends BaseEntity> {
-  where?: FindWhereOptions<Entity>;
-  limit?: number;
-  offset?: number;
+  /* Each says `| undefined` so a caller under `exactOptionalPropertyTypes`
+     can pass a value it computed as maybe-absent — see ./optional. */
+  where?: FindWhereOptions<Entity> | undefined;
+  limit?: number | undefined;
+  offset?: number | undefined;
 }
 
-export function And<Entity extends BaseEntity>(...conditions: FindWhereOptions<Entity>[]): AndCondition<Entity> {
+/**
+ * Groups conditions that must all hold.
+ *
+ * `NoInfer` on the arguments is what makes this callable. Without it TypeScript
+ * tries to infer `Entity` from the conditions themselves, and cannot: a literal
+ * like `{ name: "a" }` does not satisfy `extends BaseEntity` — an entity also
+ * carries `save`, `delete` and `_repository` — so inference falls back to the
+ * constraint and every column then reads as an excess property:
+ *
+ * ```
+ * TS2353: Object literal may only specify known properties,
+ *         and 'name' does not exist in type 'FindWhereOptions<Entity>'
+ * ```
+ *
+ * Blocking that leaves one source of inference: the position the result is
+ * used in. Inside `find({ where: … })` that is `FindWhereOptions<User>`, so
+ * `Entity` comes out as `User` and the conditions are then checked against it
+ * — unknown columns and wrong value types are still errors.
+ *
+ * The trade is that a call with no contextual type has nothing to infer from
+ * and falls back to the constraint again. Annotate the variable when that
+ * happens, or write the call where it is used:
+ *
+ * ```ts
+ * const active: FindWhereOptions<User> = And({ status: "active" });
+ * ```
+ */
+export function And<Entity extends BaseEntity>(
+  ...conditions: NoInfer<FindWhereOptions<Entity>>[]
+): AndCondition<Entity> {
   return {
     type: "AND",
     conditions,
   };
 }
-export function Or<Entity extends BaseEntity>(...conditions: FindWhereOptions<Entity>[]): OrCondition<Entity> {
+
+/** Groups conditions where any may hold. Infers as {@link And} does. */
+export function Or<Entity extends BaseEntity>(
+  ...conditions: NoInfer<FindWhereOptions<Entity>>[]
+): OrCondition<Entity> {
   return {
     type: "OR",
     conditions,
@@ -69,19 +105,19 @@ export function Between<T>(value: [T, T]) {
 
 export interface ColumnOptions {
   type: string;
-  name?: string;
-  primaryKey?: boolean;
-  notNull?: boolean;
-  unique?: boolean;
-  default?: string;
-  references?: string;
-  private?: boolean;
+  name?: string | undefined;
+  primaryKey?: boolean | undefined;
+  notNull?: boolean | undefined;
+  unique?: boolean | undefined;
+  default?: string | undefined;
+  references?: string | undefined;
+  private?: boolean | undefined;
 }
 
 export interface IndexOptions {
   name: string;
   columns: readonly string[];
-  unique?: boolean;
+  unique?: boolean | undefined;
 }
 
 export interface CheckOptions {
@@ -91,8 +127,8 @@ export interface CheckOptions {
 
 export interface SchemaOptions {
   columns: Record<string, ColumnOptions>;
-  indexes?: readonly IndexOptions[];
-  checks?: readonly CheckOptions[];
+  indexes?: readonly IndexOptions[] | undefined;
+  checks?: readonly CheckOptions[] | undefined;
 }
 
 export abstract class Repository<Entity extends BaseEntity> {
@@ -165,9 +201,9 @@ export abstract class Repository<Entity extends BaseEntity> {
     return result.rows.length ? this.hydrateRows(result.rows)[0] : null;
   }
 
-  async insert(data: Partial<Entity>): Promise<Entity>;
-  async insert(data: Partial<Entity>[]): Promise<Entity[]>;
-  async insert(data: Partial<Entity> | Partial<Entity>[]): Promise<Entity | Entity[] | null> {
+  async insert(data: PartialInput<Entity>): Promise<Entity>;
+  async insert(data: PartialInput<Entity>[]): Promise<Entity[]>;
+  async insert(data: PartialInput<Entity> | PartialInput<Entity>[]): Promise<Entity | Entity[] | null> {
     const isArray = Array.isArray(data);
     const arr = isArray ? data : [data];
     if (!arr.length) return isArray ? [] : null;
@@ -178,7 +214,7 @@ export abstract class Repository<Entity extends BaseEntity> {
     return isArray ? this.hydrateRows(result.rows) : this.hydrateRows(result.rows)[0];
   }
 
-  update(where: FindWhereOptions<Entity>, data: Partial<Entity>) {
+  update(where: FindWhereOptions<Entity>, data: PartialInput<Entity>) {
     const { sql, params } = this.queryBuilder.buildUpdate(where, data);
     return this.connection.query(sql, params);
   }
@@ -188,9 +224,9 @@ export abstract class Repository<Entity extends BaseEntity> {
     return this.connection.query(sql, params);
   }
 
-  async upsert(data: Partial<Entity>, conflictColumns: string[]): Promise<Entity>;
-  async upsert(data: Partial<Entity>[], conflictColumns: string[]): Promise<Entity[]>;
-  async upsert(data: Partial<Entity> | Partial<Entity>[], conflictColumns: string[]): Promise<Entity | Entity[] | null> {
+  async upsert(data: PartialInput<Entity>, conflictColumns: string[]): Promise<Entity>;
+  async upsert(data: PartialInput<Entity>[], conflictColumns: string[]): Promise<Entity[]>;
+  async upsert(data: PartialInput<Entity> | PartialInput<Entity>[], conflictColumns: string[]): Promise<Entity | Entity[] | null> {
     const isArray = Array.isArray(data);
     const arr = isArray ? data : [data];
     if (!arr.length) return isArray ? [] : null;

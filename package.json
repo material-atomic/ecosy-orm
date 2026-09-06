@@ -1,6 +1,6 @@
 {
   "name": "@ecosy/orm",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "A lightweight ORM with DataSource and Repository pattern for PostgreSQL",
   "license": "MIT",
   "publishConfig": {
@@ -29,13 +29,14 @@
   },
   "scripts": {
     "clean": "rimraf dist",
-    "build": "eslint src/ && rollup -c",
+    "build": "eslint src/ && yarn types:test && rollup -c",
     "prepublishOnly": "yarn clean && yarn build",
     "dev": "rollup -c --watch",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write src/",
-    "format:check": "prettier --check src/"
+    "format:check": "prettier --check src/",
+    "types:test": "tsc -p tsconfig.types-test.json"
   },
   "repository": {
     "type": "git",

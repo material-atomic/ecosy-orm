@@ -6,6 +6,9 @@
     "moduleResolution": "bundler",
     "types": ["node"],
     "strict": true,
+    /* On, so the package can never again ship input types that a project with
+       this flag cannot call. src/optional.ts explains what that costs. */
+    "exactOptionalPropertyTypes": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "declaration": true,
