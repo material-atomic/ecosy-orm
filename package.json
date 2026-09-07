@@ -1,6 +1,6 @@
 {
   "name": "@ecosy/orm",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "A lightweight ORM with DataSource and Repository pattern for PostgreSQL",
   "license": "MIT",
   "publishConfig": {
@@ -49,11 +49,11 @@
     "url": "https://github.com/material-atomic/ecosy-orm.git"
   },
   "author": "material-atomic",
+  "dependencies": {
+    "server-only": "^0.0.1"
+  },
   "peerDependencies": {
     "pg": "^8.11.0"
-  },
-  "dependencies": {
-    "@ecosy/core": "^0.5.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
