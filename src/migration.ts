@@ -1,6 +1,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import fs from "fs/promises";
-import path from "path";
+/* `node:` prefixed, so what they are is legible at the import and no
+   bundler mistakes them for packages it should try to resolve. */
+import fs from "node:fs/promises";
+import path from "node:path";
 import { DataSource } from "./data-source";
 
 const connection = new DataSource();
@@ -32,11 +34,15 @@ async function runSqlFiles(dirPath: string, trackingTable: string) {
   try {
     files = await fs.readdir(dirPath);
   } catch {
-    // Thư mục không tồn tại thì bỏ qua
+    /* No such directory. A project with no migrations of this kind is the
+       ordinary case, not a failure — the alternative is every app having to
+       create empty folders to start. */
     return;
   }
 
-  // Sắp xếp tên file (để chạy 001_, 002_ theo thứ tự)
+  /* Sorted by name, which is why migrations are numbered: `001_`, `002_`.
+     Order is the whole contract — a migration that runs before the one it
+     depends on fails, and one that runs after a later edit corrupts. */
   const sqlFiles = files.filter(f => f.endsWith(".sql")).sort();
 
   if (sqlFiles.length === 0) return;
@@ -59,7 +65,10 @@ async function runSqlFiles(dirPath: string, trackingTable: string) {
       } catch (error) {
         await connection.query("ROLLBACK");
         console.error(`[DB] Failed to run ${file}:`, error);
-        throw error; // Dừng tiến trình nếu có file bị lỗi
+        /* Stop at the first failure. Carrying on would run later migrations
+           against a schema the failed one was supposed to produce, turning one
+           readable error into a series of unrelated ones. */
+        throw error;
       }
     }
   }

@@ -31,10 +31,23 @@ export type FindWhereOptions<Entity extends BaseEntity> =
   | OrCondition<Entity>
   | FindWhereOptions<Entity>[];
 
+export type OrderDirection = "ASC" | "DESC";
+
 export interface FindOptions<Entity extends BaseEntity> {
   /* Each says `| undefined` so a caller under `exactOptionalPropertyTypes`
      can pass a value it computed as maybe-absent — see ./optional. */
   where?: FindWhereOptions<Entity> | undefined;
+  /**
+   * Column to direction, applied in the order the keys are written.
+   *
+   * Reach for it whenever `limit` is set: SQL does not promise which rows a
+   * limit returns without one, and Postgres is free to answer differently on
+   * the next call for the same query.
+   *
+   * `PartialInput` rather than `Partial` — the direction may itself be a value
+   * the caller computed and it may be absent. See ./optional.
+   */
+  order?: PartialInput<Record<Extract<keyof Entity, string>, OrderDirection>> | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
 }

@@ -31,9 +31,23 @@ const dialect: Dialect = {
     `ALTER TABLE ${dialect.quote(table)} ALTER COLUMN ${dialect.quote(column)} ` +
     `${notNull ? "SET" : "DROP"} NOT NULL`,
 
+  /**
+   * Both lookups are scoped to the search path.
+   *
+   * `information_schema` spans every schema the connection can see, so an
+   * unqualified `table_name = $1` matches things that are not yours: an entity
+   * named `tables`, `columns`, `domains`, `routines` or `sequences` finds
+   * information_schema's own view of that name and reports as existing. CREATE
+   * TABLE is then skipped and the ALTER that follows dies with 42P01 on a
+   * table that was never made.
+   */
   async tableExists(db, table) {
     const result = await db.query(
-      `SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = $1)`,
+      `SELECT EXISTS (
+         SELECT FROM information_schema.tables
+         WHERE table_name = $1
+           AND table_schema = ANY(current_schemas(false))
+       )`,
       [table],
     );
     return Boolean(result.rows[0]?.exists);
@@ -41,7 +55,10 @@ const dialect: Dialect = {
 
   async listColumns(db, table): Promise<ColumnInfo[]> {
     const result = await db.query(
-      `SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = $1`,
+      `SELECT column_name, is_nullable
+         FROM information_schema.columns
+        WHERE table_name = $1
+          AND table_schema = ANY(current_schemas(false))`,
       [table],
     );
     return result.rows.map((row: any) => ({

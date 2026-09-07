@@ -79,3 +79,14 @@ export type UserPatch = PartialInput<User>;
 /* Moved off DataSource to break the data-source ↔ repository cycle. */
 import { createRepository } from "../src/index";
 export const dynamic = createRepository(UserEntity);
+
+/* Ordering, which `order` was added for. Both the direction and the whole
+   option may be values the caller computed, and both may be absent. */
+declare const maybeDir: "ASC" | "DESC" | undefined;
+export const ordered = repo.find({ order: { name: maybeDir }, limit: maybeNumber });
+
+declare const maybeOrder: { name?: "ASC" | "DESC" | undefined } | undefined;
+export const orderedToo = repo.find({ order: maybeOrder });
+
+// @ts-expect-error "nope" is not a column
+export const badOrder = repo.find({ order: { nope: "ASC" } });

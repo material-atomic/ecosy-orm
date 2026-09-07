@@ -32,6 +32,31 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return this.schema.columns[tsKey]?.name || tsKey;
   }
 
+  /** Keys the entity actually declares. A typo never reaches SQL as a column name. */
+  private known(tsKeys: string[]): string[] {
+    return tsKeys.filter((key) => key in this.schema.columns);
+  }
+
+  /**
+   * Encodes a value for the column it is going into.
+   *
+   * `pg` turns a plain object into JSON but turns a JS array into a Postgres
+   * array literal `{a,b}`, which `jsonb` rejects with "invalid input syntax for
+   * type json". The column type is declared, so the builder knows which values
+   * need serialising and does it for both shapes — reading stays symmetric,
+   * since the driver parses jsonb back into real objects and arrays.
+   */
+  private encode(tsKey: string, value: any) {
+    const type = (this.schema.columns[tsKey]?.type || "").toUpperCase();
+    const isJson = type === "JSON" || type === "JSONB";
+
+    if (!isJson || value === null || value === undefined || typeof value === "string") {
+      return value;
+    }
+
+    return JSON.stringify(value);
+  }
+
   private withEntity(tsKey: string) {
     return `${this.q(this.entityName)}.${this.q(this.dbCol(tsKey))}`;
   }
@@ -70,9 +95,22 @@ export class QueryBuilder<Entity extends BaseEntity> {
 
     const objectWhere = where as ObjectWhere<Entity>;
     const conditions = Object.entries(objectWhere || {}).map(([tsKey, value]) => {
-      if (value !== null && typeof value === "object" && "type" in value) {
+      /* `undefined` means "no condition on this field", the way every other ORM
+         reads it. Pushing it as a parameter made it a null comparison, which is
+         never true — a filter the caller did not ask for and cannot see. */
+      if (value === undefined) return "";
+
+      /* `x = NULL` is UNKNOWN in SQL and never true, so a null here has to
+         become IS NULL. It used to compile to a placeholder with a null
+         parameter: no error, no rows, and the same silence from update and
+         delete, which share this method. `{ deletedAt: null }` type-checks on
+         any nullable column, so the type system was actively inviting it. */
+      if (value === null) return `${this.withEntity(tsKey)} IS NULL`;
+
+      if (typeof value === "object" && "type" in value) {
         const v = value as any;
         if (v.type === "NOT") {
+          if (v.value === null) return `${this.withEntity(tsKey)} IS NOT NULL`;
           params.push(v.value);
           return `${this.withEntity(tsKey)} != ${this.dialect.placeholder(params.length)}`;
         }
@@ -85,9 +123,9 @@ export class QueryBuilder<Entity extends BaseEntity> {
           return `${this.withEntity(tsKey)} BETWEEN ${this.dialect.placeholder(params.length - 1)} AND ${this.dialect.placeholder(params.length)}`;
         }
       }
-      params.push(value);
+      params.push(this.encode(tsKey, value));
       return `${this.withEntity(tsKey)} = ${this.dialect.placeholder(params.length)}`;
-    });
+    }).filter(Boolean);
 
     return conditions.length ? conditions.join(" AND ") : "";
   }
@@ -100,6 +138,18 @@ export class QueryBuilder<Entity extends BaseEntity> {
     if (where) {
       result.push(`WHERE ${where}`);
     }
+
+    /* LIMIT without an order is not deterministic: the engine may return any N
+       rows that match, and is free to return different ones next time. Keys are
+       whitelisted against the schema, so an order clause cannot carry SQL in. */
+    const order = Object.entries(options.order ?? {})
+      .filter(([tsKey]) => tsKey in this.schema.columns)
+      .map(([tsKey, dir]) => `${this.withEntity(tsKey)} ${dir === "DESC" ? "DESC" : "ASC"}`);
+
+    if (order.length) {
+      result.push(`ORDER BY ${order.join(", ")}`);
+    }
+
     if (options.limit) {
       result.push(`LIMIT ${options.limit}`);
     }
@@ -118,11 +168,15 @@ export class QueryBuilder<Entity extends BaseEntity> {
 
   buildInsert(arr: PartialInput<Entity>[]): { sql: string, params: any[] } {
     if (!arr.length) return { sql: "", params: [] };
-    const tsKeys = Object.keys(arr[0]);
+    /* The UNION of every row's keys, not the first row's. Taking row 0 dropped
+       a field that only later rows carried, and turned a field missing from a
+       later row into NULL — which surfaced as a not-null violation naming the
+       column rather than the real cause, a row whose shape differed. */
+    const tsKeys = this.known([...new Set(arr.flatMap((row) => Object.keys(row)))]);
     const params: any[] = [];
     const values = arr.map(obj => {
       return `(${tsKeys.map(c => {
-        params.push((obj as any)[c]);
+        params.push(this.encode(c, (obj as any)[c]));
         return `${this.dialect.placeholder(params.length)}`;
       }).join(", ")})`;
     }).join(", ");
@@ -138,10 +192,12 @@ export class QueryBuilder<Entity extends BaseEntity> {
 
   buildUpdate(where: FindWhereOptions<Entity>, data: PartialInput<Entity>): { sql: string, params: any[] } {
     const params: any[] = [];
-    const assignments = Object.entries(data).map(([tsKey, v]) => {
-      params.push(v);
-      return `${this.q(this.dbCol(tsKey))} = ${this.dialect.placeholder(params.length)}`;
-    }).join(", ");
+    const assignments = Object.entries(data)
+      .filter(([tsKey]) => tsKey in this.schema.columns)
+      .map(([tsKey, v]) => {
+        params.push(this.encode(tsKey, v));
+        return `${this.q(this.dbCol(tsKey))} = ${this.dialect.placeholder(params.length)}`;
+      }).join(", ");
     const condition = this.buildWhereSql(where, params);
     
     const sql = [
@@ -171,11 +227,15 @@ export class QueryBuilder<Entity extends BaseEntity> {
 
   buildUpsert(arr: PartialInput<Entity>[], conflictColumns: string[]): { sql: string, params: any[] } {
     if (!arr.length) return { sql: "", params: [] };
-    const tsKeys = Object.keys(arr[0]);
+    /* The UNION of every row's keys, not the first row's. Taking row 0 dropped
+       a field that only later rows carried, and turned a field missing from a
+       later row into NULL — which surfaced as a not-null violation naming the
+       column rather than the real cause, a row whose shape differed. */
+    const tsKeys = this.known([...new Set(arr.flatMap((row) => Object.keys(row)))]);
     const params: any[] = [];
     const values = arr.map(obj => {
       return `(${tsKeys.map(c => {
-        params.push((obj as any)[c]);
+        params.push(this.encode(c, (obj as any)[c]));
         return `${this.dialect.placeholder(params.length)}`;
       }).join(", ")})`;
     }).join(", ");

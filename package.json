@@ -20,6 +20,12 @@
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     },
+    "./migration": {
+      "source": "./src/migration.ts",
+      "types": "./dist/migration.d.ts",
+      "import": "./dist/migration.mjs",
+      "require": "./dist/migration.js"
+    },
     "./drivers/*": {
       "source": "./src/drivers/*.ts",
       "types": "./dist/drivers/*.d.ts",
