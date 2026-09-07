@@ -29,8 +29,16 @@ export type FindWhereOptions<Entity extends BaseEntity> =
   | OrCondition<Entity>
   | FindWhereOptions<Entity>[];
 
+export type OrderDirection = "ASC" | "DESC";
+
 export interface FindOptions<Entity extends BaseEntity> {
   where?: FindWhereOptions<Entity>;
+  /**
+   * Column to direction, applied in the order the keys are written. Reach for it
+   * whenever `limit` is set: SQL does not promise which rows a limit returns
+   * without one.
+   */
+  order?: Partial<Record<Extract<keyof Entity, string>, OrderDirection>>;
   limit?: number;
   offset?: number;
 }
