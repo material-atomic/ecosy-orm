@@ -6,39 +6,7 @@ import type { Dialect, Queryable } from "./drivers/types";
 import { currentDialect } from "./drivers/current";
 
 
-/**
- * Fills `{name}` placeholders in a SQL template.
- *
- * Local rather than imported. This was the only thing the package used from
- * `@ecosy/core`, and it used the plainest part of it: the templates below hold
- * five single-word placeholders and no dotted paths, arrays or nested objects,
- * which is what that function exists for. A dependency carried by everyone who
- * installs this, and a version to keep in step, for a `String.replace`.
- *
- * The replacement is a **function**, and that is not a style choice: the values
- * substituted here contain `$1`, `$2` — the parameter placeholders — and in a
- * replacement *string* those are capture-group references. `($1, $2)` would
- * come out as the matched text repeated, producing SQL that is syntactically
- * fine and asks for the wrong columns.
- *
- * A name with no value is left as it was written. Broken SQL that still shows
- * `{columns}` says which template failed; silently dropping it does not.
- */
-function interpolate(template: string, values: Record<string, string>) {
-  return template.replace(/\{(\w+)\}/g, (match, key: string) =>
-    Object.hasOwn(values, key) ? values[key] : match,
-  );
-}
-
 export class QueryBuilder<Entity extends BaseEntity> {
-  private _sqls = {
-    select: "SELECT {columns} FROM {entity}",
-    insert: "INSERT INTO {entity} ({columns}) VALUES {values}",
-    update: "UPDATE {entity} SET {assignments}",
-    delete: "DELETE FROM {entity}",
-    count: "SELECT COUNT(1) as count FROM {entity}",
-  };
-
   constructor(
     public entityName: string,
     public schema: SchemaOptions,
@@ -180,11 +148,7 @@ export class QueryBuilder<Entity extends BaseEntity> {
       result.push(`OFFSET ${options.offset}`);
     }
 
-    const selectSql = interpolate(this._sqls.select, {
-      columns: this.getQueryColumns(),
-      entity: this.entityName,
-    });
-
+    const selectSql = `SELECT ${this.getQueryColumns()} FROM ${this.entityName}`;
     const sql = [selectSql, result.join(" ")].filter(Boolean).join(" ");
     return { sql, params };
   }
@@ -204,11 +168,8 @@ export class QueryBuilder<Entity extends BaseEntity> {
       }).join(", ")})`;
     }).join(", ");
     
-    const sql = interpolate(this._sqls.insert, {
-      entity: this.entityName,
-      columns: tsKeys.map(c => this.q(this.dbCol(c))).join(", "),
-      values
-    }) + this.returning();
+    const columns = tsKeys.map(c => this.q(this.dbCol(c))).join(", ");
+    const sql = `INSERT INTO ${this.entityName} (${columns}) VALUES ${values}` + this.returning();
 
     return { sql, params };
   }
@@ -224,11 +185,8 @@ export class QueryBuilder<Entity extends BaseEntity> {
     const condition = this.buildWhereSql(where, params);
     
     const sql = [
-      interpolate(this._sqls.update, {
-        entity: this.entityName,
-        assignments
-      }),
-      condition ? `WHERE ${condition}` : ""
+      `UPDATE ${this.entityName} SET ${assignments}`,
+      condition ? `WHERE ${condition}` : "",
     ].filter(Boolean).join(" ");
 
     return { sql, params };
@@ -239,10 +197,8 @@ export class QueryBuilder<Entity extends BaseEntity> {
     const condition = this.buildWhereSql(where, params);
     
     const sql = [
-      interpolate(this._sqls.delete, {
-        entity: this.entityName
-      }),
-      condition ? `WHERE ${condition}` : ""
+      `DELETE FROM ${this.entityName}`,
+      condition ? `WHERE ${condition}` : "",
     ].filter(Boolean).join(" ");
 
     return { sql, params };
@@ -263,11 +219,8 @@ export class QueryBuilder<Entity extends BaseEntity> {
       }).join(", ")})`;
     }).join(", ");
     
-    const insertSql = interpolate(this._sqls.insert, {
-      entity: this.entityName,
-      columns: tsKeys.map(c => this.q(this.dbCol(c))).join(", "),
-      values
-    });
+    const columns = tsKeys.map(c => this.q(this.dbCol(c))).join(", ");
+    const insertSql = `INSERT INTO ${this.entityName} (${columns}) VALUES ${values}`;
 
     const dbConflictColumns = conflictColumns.map(c => this.dbCol(c));
 

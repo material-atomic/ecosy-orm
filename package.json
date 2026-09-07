@@ -49,9 +49,6 @@
     "url": "https://github.com/material-atomic/ecosy-orm.git"
   },
   "author": "material-atomic",
-  "dependencies": {
-    "server-only": "^0.0.1"
-  },
   "peerDependencies": {
     "pg": "^8.11.0"
   },

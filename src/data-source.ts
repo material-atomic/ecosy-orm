@@ -1,5 +1,4 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import "server-only";
 
 import type { EntityConstructor } from "./entity";
 import { Transaction } from "./transaction";

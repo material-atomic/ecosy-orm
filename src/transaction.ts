@@ -1,5 +1,4 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import "server-only";
 
 import type { DriverConnection, QueryResultLike } from "./drivers/types";
 
