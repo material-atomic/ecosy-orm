@@ -8,6 +8,7 @@ import type {
   DriverConnection,
   Queryable,
   QueryResultLike,
+  SyncOptions,
 } from "./types";
 
 /** Postgres dialect: `$n` placeholders, double-quoted identifiers, full RETURNING. */
@@ -17,6 +18,7 @@ const dialect: Dialect = {
   quote: (identifier) => `"${identifier.replace(/"/g, '""')}"`,
 
   supportsReturning: true,
+  supportsUnvalidatedCheck: true,
 
   upsertClause: (conflictColumns, updateColumns) => {
     const target = conflictColumns.map((c) => dialect.quote(c)).join(", ");
@@ -55,7 +57,8 @@ const dialect: Dialect = {
 
   async listColumns(db, table): Promise<ColumnInfo[]> {
     const result = await db.query(
-      `SELECT column_name, is_nullable
+      `SELECT column_name, is_nullable, data_type,
+              character_maximum_length, numeric_precision, numeric_scale
          FROM information_schema.columns
         WHERE table_name = $1
           AND table_schema = ANY(current_schemas(false))`,
@@ -64,8 +67,42 @@ const dialect: Dialect = {
     return result.rows.map((row: any) => ({
       name: row.column_name,
       nullable: row.is_nullable === "YES",
+      type: String(row.data_type),
+      length: row.character_maximum_length ?? null,
+      precision: row.numeric_precision ?? null,
+      scale: row.numeric_scale ?? null,
     }));
   },
+
+  /* Indexes that exist in their own right. One backing a primary key or a
+     unique constraint belongs to that constraint and is dropped with it, never
+     on its own. */
+  async listOwnedIndexes(db, table): Promise<string[]> {
+    const result = await db.query(
+      `SELECT i.indexname
+         FROM pg_indexes i
+         LEFT JOIN pg_constraint c
+           ON c.conname = i.indexname
+          AND c.conrelid = i.tablename::regclass
+        WHERE i.tablename = $1
+          AND c.conname IS NULL`,
+      [table],
+    );
+    return result.rows.map((row: any) => String(row.indexname));
+  },
+
+  dropColumn: (table, column) =>
+    `ALTER TABLE ${dialect.quote(table)} DROP COLUMN ${dialect.quote(column)}`,
+
+  renameColumn: (table, from, to) =>
+    `ALTER TABLE ${dialect.quote(table)} RENAME COLUMN ${dialect.quote(from)} TO ${dialect.quote(to)}`,
+
+  /* `USING` because Postgres will not change a type it cannot cast implicitly,
+     and an explicit cast is the difference between a column that converts and
+     one that refuses. */
+  alterType: (table, column, type) =>
+    `ALTER TABLE ${dialect.quote(table)} ALTER COLUMN ${dialect.quote(column)} ` +
+    `TYPE ${type} USING ${dialect.quote(column)}::${type}`,
 
   async listIndexes(db, table) {
     const result = await db.query(
@@ -106,7 +143,15 @@ const dialect: Dialect = {
  * `exactOptionalPropertyTypes`. `pg` is not ours to change, so the relaxation
  * happens on the way in.
  */
-export function PgDriver(config: PartialInput<PoolConfig>): Driver {
+export interface PgDriverConfig extends PartialInput<PoolConfig> {
+  /** See {@link SyncOptions}. Not passed to `pg`. */
+  sync?: SyncOptions | undefined;
+}
+
+export function PgDriver(config: PgDriverConfig): Driver {
+  /* Split before the rest reaches `new Pool()`, which is handed the object
+     untouched and would carry an option it knows nothing about. */
+  const { sync = {}, ...poolConfig } = config;
   /* Held on globalThis under a Symbol so a hot reload reuses the pool instead
      of opening a second one and quietly doubling the connection count. */
   const POOL = Symbol.for("@ecosy/orm:pg-pool");
@@ -122,12 +167,13 @@ export function PgDriver(config: PartialInput<PoolConfig>): Driver {
   return {
     name: "pg",
     dialect,
+    sync,
 
     async connect() {
       if (global[POOL]) return;
 
       const { Pool } = await import("pg");
-      global[POOL] = new Pool(config as PoolConfig);
+      global[POOL] = new Pool(poolConfig as PoolConfig);
     },
 
     async end() {

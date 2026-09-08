@@ -49,7 +49,14 @@ function onwarn(warning, warn) {
 // Minification configuration
 const minifyOptions = {
   compress: {
-    drop_console: true,
+    /* Named methods rather than `true`. Dropping every console call took the
+       warnings with it — a column being dropped, a constraint going in
+       unvalidated, a rename moving data — so the package performed those and
+       said nothing, in the build everyone actually installs. `console.error`
+       went the same way, which meant a failed migration printed nothing.
+
+       Diagnostics still go; anything a consumer needs to see stays. */
+    drop_console: ["log", "info", "debug"],
     drop_debugger: true,
     pure_funcs: ["console.log", "console.info", "console.debug"],
   },

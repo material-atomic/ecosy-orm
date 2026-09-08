@@ -19,6 +19,18 @@ export interface DriverConnection extends Queryable {
 export interface ColumnInfo {
   name: string;
   nullable: boolean;
+  /** The engine's own name for the type, for deciding whether it has to change. */
+  type: string;
+  /**
+   * The size the engine is holding it at, when the type has one.
+   *
+   * `character varying` says nothing about whether the column is 120 or 255
+   * wide, so without this a VARCHAR that changed length reads as unchanged and
+   * the column silently keeps the old limit.
+   */
+  length?: number | null;
+  precision?: number | null;
+  scale?: number | null;
 }
 
 /**
@@ -43,6 +55,15 @@ export interface Dialect {
    * for UPDATE, and MySQL has none at all.
    */
   readonly supportsReturning: boolean;
+  /**
+   * Whether a check constraint can be added without validating existing rows.
+   *
+   * Postgres has `NOT VALID`, and it is what lets a narrowed constraint apply
+   * to a table whose old rows no longer satisfy it: everything written from
+   * then on is checked, and the rows already there are left alone. Without it
+   * the only outcomes are refusing the change or refusing to start.
+   */
+  readonly supportsUnvalidatedCheck: boolean;
 
   /**
    * The upsert tail.
@@ -66,6 +87,20 @@ export interface Dialect {
   listIndexes(db: Queryable, table: string): Promise<Record<string, string>>;
   /** Check-constraint name to its expression. */
   listChecks(db: Queryable, table: string): Promise<Record<string, string>>;
+  /**
+   * Indexes this table has that no constraint owns.
+   *
+   * A primary key and a unique constraint each carry an index, and those
+   * cannot be dropped directly — the constraint owns them. Sync needs to know
+   * which indexes are its own to remove before it removes any.
+   */
+  listOwnedIndexes(db: Queryable, table: string): Promise<string[]>;
+  /** Drops a column, with whatever it held. */
+  dropColumn(table: string, column: string): string;
+  /** Renames a column, keeping what it holds. */
+  renameColumn(table: string, from: string, to: string): string;
+  /** Changes a column's type in place. */
+  alterType(table: string, column: string, type: string): string;
 }
 
 /**
@@ -84,11 +119,30 @@ export interface Dialect {
  *   .entities([UserEntity])
  *   .initialize();
  */
+/** How much of the schema sync a driver is configured to do. */
+export interface SyncOptions {
+  /**
+   * Whether to keep a snapshot of each entity's shape, in `_ecosy_schema`.
+   *
+   * It buys one thing: a column rename keeps its data. The live database only
+   * ever knew column names, so a rename and a drop-plus-add are the same two
+   * facts to it; a snapshot also records the **property key**, which survives
+   * the rename and is what tells them apart.
+   *
+   * Off by default. It is a table this package creates and writes on every
+   * sync, and a project that never renames a column gets nothing for it.
+   */
+  snapshot?: boolean | undefined;
+}
+
 export interface Driver extends Queryable {
   /** For error messages and logs — `"pg"`, `"mariadb"`. */
   readonly name: string;
 
   readonly dialect: Dialect;
+
+  /** Set where the connection is configured — see {@link SyncOptions}. */
+  readonly sync: SyncOptions;
 
   /** Opens the pool. Called once by {@link DataSource.initialize}. */
   connect(): Promise<void>;
