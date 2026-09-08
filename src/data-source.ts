@@ -2,6 +2,7 @@
 
 import type { EntityConstructor } from "./entity";
 import { Transaction } from "./transaction";
+import { currentLogger, setLogger, type Logger } from "./logger";
 import type { Driver, QueryResultLike } from "./drivers/types";
 import { currentDriver, setDriver } from "./drivers/current";
 
@@ -37,6 +38,18 @@ export class DataSource {
     return this.current.dialect;
   }
 
+  /**
+   * Installs where this package's diagnostics go. Chainable, and shaped like
+   * {@link DataSource.driver} so both capabilities are installed the same way.
+   *
+   * @example
+   * DataSource.logger(pino).entities([User]).initialize(PgDriver(config));
+   */
+  static logger(logger: Logger): typeof DataSource {
+    setLogger(logger);
+    return DataSource;
+  }
+
   /** Entities whose schema `initialize` should sync. */
   static entities(entities: EntityConstructor<any>[]) {
     this._entities = Array.from(new Set([...entities]));
@@ -62,7 +75,7 @@ export class DataSource {
         try {
           await schemaBuilder.syncSchema(EntityClass.entityName, EntityClass.schema);
         } catch (error) {
-          console.error(`[DB] Failed to sync schema for ${EntityClass.entityName}:`, error);
+          currentLogger().error(`[DB] Failed to sync schema for ${EntityClass.entityName}`, error);
           throw error;
         }
       }

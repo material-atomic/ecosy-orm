@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { PartialInput } from "./optional";
+import { currentLogger } from "./logger";
 import type { FindOptions, FindWhereOptions, ObjectWhere, SchemaOptions } from "./repository";
 import type { Entity as BaseEntity } from "./entity";
 import type { ColumnInfo, Dialect, Queryable, SyncOptions } from "./drivers/types";
@@ -412,7 +413,7 @@ export class SchemaBuilder {
        entity now uses. Left to the reconciliation below, each one would be a
        drop and an add — the same two statements, and the data gone. */
     for (const { from, to } of this.renames(previous, schema, existingCols)) {
-      console.warn(`[DB] Renaming ${entityName}.${from} → ${to}`);
+      currentLogger().warn(`[DB] Renaming ${entityName}.${from} → ${to}`);
       await this.connection.query(this.dialect.renameColumn(entityName, from, to));
       existingCols[to] = { ...existingCols[from], name: to };
       delete existingCols[from];
@@ -444,7 +445,7 @@ export class SchemaBuilder {
          compared by whether one contains the other's words rather than as
          strings. Getting that wrong rewrites every column on every boot. */
       if (this.typeDiffers(opt.type as string, existingCols[dbCol])) {
-        console.warn(
+        currentLogger().warn(
           `[DB] ${entityName}.${dbCol}: ${existingCols[dbCol].type} → ${opt.type} — the column is rewritten.`,
         );
         await this.connection.query(
@@ -467,7 +468,7 @@ export class SchemaBuilder {
     for (const name of Object.keys(existingCols)) {
       if (declared.has(name)) continue;
 
-      console.warn(`[DB] Dropping ${entityName}.${name} — the entity no longer declares it.`);
+      currentLogger().warn(`[DB] Dropping ${entityName}.${name} — the entity no longer declares it.`);
       await this.connection.query(this.dialect.dropColumn(entityName, name));
       delete existingCols[name];
     }
@@ -488,7 +489,7 @@ export class SchemaBuilder {
       const uniqueMatch = idx.unique ? currentDef.includes("UNIQUE") : !currentDef.includes("UNIQUE");
 
       if (!colsMatch || !uniqueMatch) {
-        console.warn(`[DB] Recreating index ${idx.name} on ${entityName}.`);
+        currentLogger().warn(`[DB] Recreating index ${idx.name} on ${entityName}.`);
         await this.connection.query(`DROP INDEX ${this.dialect.quote(idx.name)}`);
         await this.connection.query(create);
       }
@@ -502,7 +503,7 @@ export class SchemaBuilder {
     for (const name of await this.dialect.listOwnedIndexes(this.connection, entityName)) {
       if (declaredIndexes.has(name)) continue;
 
-      console.warn(`[DB] Dropping index ${name} on ${entityName} — no longer declared.`);
+      currentLogger().warn(`[DB] Dropping index ${name} on ${entityName} — no longer declared.`);
       await this.connection.query(`DROP INDEX ${this.dialect.quote(name)}`);
     }
 
@@ -518,7 +519,7 @@ export class SchemaBuilder {
          identifiers it mentions rather than character by character. */
       const tokens = chk.expression.match(/[a-zA-Z0-9_]{2,}/g) || [];
       if (!tokens.every((t: string) => existingChecks[chk.name].includes(t))) {
-        console.warn(`[DB] Recreating check constraint ${chk.name} on ${entityName}.`);
+        currentLogger().warn(`[DB] Recreating check constraint ${chk.name} on ${entityName}.`);
 
         /* Added under a temporary name first, then swapped. Dropping first
            leaves a window with no constraint at all, and if the new one is
@@ -544,7 +545,7 @@ export class SchemaBuilder {
             this.checkStatement(entityName, { ...chk, name: staging }, false),
           );
 
-          console.warn(
+          currentLogger().warn(
             `[DB] ${entityName}.${chk.name} added NOT VALID: existing rows do not all ` +
               `satisfy ${chk.expression}. New writes are checked; migrate the old rows ` +
               `and run VALIDATE CONSTRAINT to finish.`,
@@ -567,7 +568,7 @@ export class SchemaBuilder {
     for (const name of Object.keys(existingChecks)) {
       if (declaredChecks.has(name)) continue;
 
-      console.warn(`[DB] Dropping check ${name} on ${entityName} — no longer declared.`);
+      currentLogger().warn(`[DB] Dropping check ${name} on ${entityName} — no longer declared.`);
       await this.connection.query(
         `ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(name)}`,
       );

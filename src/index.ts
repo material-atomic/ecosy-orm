@@ -7,6 +7,7 @@ export * from "./transaction";
    their client package by dynamic import, so the root never pulls one in. */
 export type * from "./drivers/types";
 export * from "./optional";
+export * from "./logger";
 
 /* `./migration` is not here, on the same reasoning as the drivers. It reads
    the filesystem — `node:fs/promises`, `node:path` — so exporting it from the

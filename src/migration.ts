@@ -12,7 +12,7 @@ async function checkConnection() {
     await connection.query("SELECT 1");
     return true;
   } catch (error) {
-    console.error("[DB] Connection failed:", error);
+    currentLogger().error("[DB] Connection failed:", error);
     return false;
   }
 }
@@ -52,7 +52,7 @@ async function runSqlFiles(dirPath: string, trackingTable: string) {
 
   for (const file of sqlFiles) {
     if (!executedFiles.has(file)) {
-      console.log(`[DB] Running ${trackingTable}: ${file}...`);
+      currentLogger().info(`[DB] Running ${trackingTable}: ${file}...`);
       const filePath = path.join(dirPath, file);
       const sql = await fs.readFile(filePath, "utf-8");
 
@@ -61,10 +61,10 @@ async function runSqlFiles(dirPath: string, trackingTable: string) {
         await connection.query(sql);
         await connection.query(`INSERT INTO ${trackingTable} (name) VALUES ($1)`, [file]);
         await connection.query("COMMIT");
-        console.log(`[DB] Successfully ran ${file}`);
+        currentLogger().info(`[DB] Successfully ran ${file}`);
       } catch (error) {
         await connection.query("ROLLBACK");
-        console.error(`[DB] Failed to run ${file}:`, error);
+        currentLogger().error(`[DB] Failed to run ${file}:`, error);
         /* Stop at the first failure. Carrying on would run later migrations
            against a schema the failed one was supposed to produce, turning one
            readable error into a series of unrelated ones. */
@@ -75,17 +75,18 @@ async function runSqlFiles(dirPath: string, trackingTable: string) {
 }
 
 import { SchemaBuilder } from "./query-builder";
+import { currentLogger } from "./logger";
 
 export async function syncEntities(entityClasses: any[]) {
-  console.log("[DB] Syncing schemas from entities...");
+  currentLogger().info("[DB] Syncing schemas from entities...");
   const schemaBuilder = new SchemaBuilder(connection);
   for (const EntityClass of entityClasses) {
     if (EntityClass.entityName && EntityClass.schema) {
       try {
         await schemaBuilder.syncSchema(EntityClass.entityName, EntityClass.schema);
-        console.log(`[DB] Synced schema for ${EntityClass.name || EntityClass.entityName}`);
+        currentLogger().info(`[DB] Synced schema for ${EntityClass.name || EntityClass.entityName}`);
       } catch (error) {
-        console.error(`[DB] Failed to run sync query for ${EntityClass.name || EntityClass.entityName}:`, error);
+        currentLogger().error(`[DB] Failed to run sync query for ${EntityClass.name || EntityClass.entityName}:`, error);
         throw error;
       }
     }
@@ -96,11 +97,11 @@ export async function initDatabase() {
   const isConnected = await checkConnection();
   if (!isConnected) return;
 
-  console.log("[DB] Connected. Checking migrations...");
+  currentLogger().info("[DB] Connected. Checking migrations...");
   const migrationsDir = path.join(process.cwd(), "src/core/db/migrations");
   await runSqlFiles(migrationsDir, "_migrations");
 
-  console.log("[DB] Checking seeds...");
+  currentLogger().info("[DB] Checking seeds...");
   const seedsDir = path.join(process.cwd(), "seeds");
   await runSqlFiles(seedsDir, "_seeds");
 }
