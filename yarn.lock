@@ -2,11 +2,6 @@
 # yarn lockfile v1
 
 
-"@ecosy/core@^0.5.0":
-  version "0.5.0"
-  resolved "https://registry.yarnpkg.com/@ecosy/core/-/core-0.5.0.tgz#8d2f72b3b8d4ed4e920cc2724d5d0fcecc837ad3"
-  integrity sha512-NLUOnhDeZDyt3fNjFDMDBYr25bM4faIyE+sOU4k7DNyouF8ySQeWU1xmh0xINLRCdQOsq+iO7lbP7fSVUCbZ9A==
-
 "@eslint-community/eslint-utils@^4.8.0", "@eslint-community/eslint-utils@^4.9.1":
   version "4.10.1"
   resolved "https://registry.yarnpkg.com/@eslint-community/eslint-utils/-/eslint-utils-4.10.1.tgz#8911bd72b2c3640a543609e0400b8c4d2e7e7cb6"
