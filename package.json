@@ -1,6 +1,6 @@
 {
   "name": "@ecosy/orm",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "description": "A lightweight ORM with DataSource and Repository pattern for PostgreSQL",
   "license": "MIT",
   "publishConfig": {
