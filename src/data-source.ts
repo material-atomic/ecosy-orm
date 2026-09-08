@@ -43,7 +43,9 @@ export class DataSource {
    * {@link DataSource.driver} so both capabilities are installed the same way.
    *
    * @example
-   * DataSource.logger(pino).entities([User]).initialize(PgDriver(config));
+   * import { Logger } from "@ecosy/logger";
+   * const AppLogger = Logger({ standard: "JSON", service: "api" });
+   * DataSource.logger(new AppLogger()).entities([User]).initialize(PgDriver(config));
    */
   static logger(logger: Logger): typeof DataSource {
     setLogger(logger);
