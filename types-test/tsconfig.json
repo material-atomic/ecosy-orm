@@ -1,0 +1,13 @@
+/* Chỉ để editor bắt đúng project cho thư mục này.
+ *
+ * tsconfig.json ở gốc chỉ include "src", nên language server mở file trong
+ * types-test/ sẽ rơi về project suy luận, nơi exactOptionalPropertyTypes tắt.
+ * Cờ tắt thì dòng Partial<Row> hết lỗi và @ts-expect-error hoá thừa —
+ * TS2578, gạch đỏ đúng cái dòng đang chứng minh điều ngược lại.
+ *
+ * yarn types:test vẫn chạy ../tsconfig.types-test.json; file này không thêm
+ * cấu hình nào, chỉ trỏ editor vào đó.
+ */
+{
+  "extends": "../tsconfig.types-test.json"
+}
