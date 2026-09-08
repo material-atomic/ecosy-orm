@@ -35,8 +35,8 @@
   },
   "scripts": {
     "clean": "rimraf dist",
-    "build": "eslint src/ && yarn types:test && rollup -c",
-    "prepublishOnly": "yarn clean && yarn build",
+    "build": "yarn clean && eslint src/ && yarn types:test && rollup -c",
+    "prepublishOnly": "yarn build",
     "dev": "rollup -c --watch",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
