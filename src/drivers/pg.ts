@@ -22,9 +22,21 @@ const dialect: Dialect = {
 
   upsertClause: (conflictColumns, updateColumns) => {
     const target = conflictColumns.map((c) => dialect.quote(c)).join(", ");
-    const assignments = updateColumns
-      .map((c) => `${dialect.quote(c)} = EXCLUDED.${dialect.quote(c)}`)
-      .join(", ");
+
+    /* Every inserted column is a conflict column, so there is nothing left to
+       assign. An empty SET is a syntax error, and the obvious repair — DO
+       NOTHING — is worse than it looks: DO NOTHING returns no row, so RETURNING
+       yields nothing on conflict and `upsert()` hands back undefined for a
+       signature that promises an Entity. That trades a syntax error thrown on
+       the first run for an undefined appearing only when a row already existed.
+       
+       Assigning a conflict column to itself keeps the row locked, matched and
+       RETURNED, which is the contract callers were given. It writes nothing
+       new: EXCLUDED holds the value that conflicted with the identical stored
+       one. */
+    const assignments = updateColumns.length
+      ? updateColumns.map((c) => `${dialect.quote(c)} = EXCLUDED.${dialect.quote(c)}`).join(", ")
+      : `${dialect.quote(conflictColumns[0]!)} = EXCLUDED.${dialect.quote(conflictColumns[0]!)}`;
 
     return `ON CONFLICT (${target}) DO UPDATE SET ${assignments}`;
   },

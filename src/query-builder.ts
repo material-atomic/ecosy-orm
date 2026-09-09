@@ -223,6 +223,19 @@ export class QueryBuilder<Entity extends BaseEntity> {
     const columns = tsKeys.map(c => this.q(this.dbCol(c))).join(", ");
     const insertSql = `INSERT INTO ${this.entityName} (${columns}) VALUES ${values}`;
 
+    /* Without a conflict target Postgres cannot infer an arbiter index, and the
+       clause degenerates to `ON CONFLICT ()` — another syntax error built one
+       string concatenation at a time. An upsert with nothing to conflict on is
+       an insert, and saying so is more useful than emitting SQL that cannot
+       parse. */
+    if (!conflictColumns.length) {
+      throw new Error(
+        `[QueryBuilder] upsert() on "${this.entityName}" was given no conflict ` +
+          `columns. Name the columns whose unique index decides a collision, or ` +
+          `call insert() if there is nothing to collide with.`,
+      );
+    }
+
     const dbConflictColumns = conflictColumns.map(c => this.dbCol(c));
 
     const updateColumns = tsKeys
