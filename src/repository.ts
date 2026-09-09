@@ -159,6 +159,18 @@ export interface CheckOptions {
 export interface SchemaOptions {
   columns: Record<string, ColumnOptions>;
   indexes?: readonly IndexOptions[] | undefined;
+  /**
+   * Declared here or not at all.
+   *
+   * Sync drops every check on the table it does not find declared — including
+   * ones it never created. A constraint added by hand in psql survives exactly
+   * until the next boot, which is long enough to look like it worked.
+   *
+   * That is the same rule columns and indexes follow: the entity is the schema,
+   * and anything the entity does not say is something the table should not
+   * have. It is worth stating on this field because a CHECK is the one people
+   * reach for a migration tool to add.
+   */
   checks?: readonly CheckOptions[] | undefined;
 }
 

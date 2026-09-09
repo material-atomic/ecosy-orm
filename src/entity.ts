@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { PartialInput } from "./optional";
-import type { Repository, FindWhereOptions, ColumnOptions, IndexOptions } from "./repository";
+import type { Repository, FindWhereOptions, ColumnOptions, IndexOptions, CheckOptions } from "./repository";
 
 export type InferColumnType<T extends string> = 
   T extends "TEXT" | "UUID" ? string :
@@ -18,7 +18,7 @@ export type InferSchema<TCols extends Record<string, ColumnOptions>> = {
 export type EntityConstructor<T extends Entity = Entity> = {
   new (): T;
   readonly entityName: string;
-  readonly schema: { columns: Record<string, ColumnOptions>; indexes?: readonly IndexOptions[] };
+  readonly schema: { columns: Record<string, ColumnOptions>; indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[] };
   hydrate: typeof Entity.hydrate;
 };
 
@@ -67,7 +67,7 @@ export abstract class Entity {
   static create<
     TName extends string, 
     TCols extends Record<string, ColumnOptions>
-  >(entityName: TName, schema: { columns: TCols, indexes?: readonly IndexOptions[] }) {
+  >(entityName: TName, schema: { columns: TCols, indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[] }) {
     
     /* A column with no `name` is named after its key. Done once here so every
        reader of the schema sees a name, rather than each one falling back. */
@@ -122,7 +122,7 @@ export abstract class Entity {
     return GeneratedEntity as unknown as {
       new (): GeneratedEntity & InferSchema<TCols>;
       readonly entityName: TName;
-      readonly schema: { columns: TCols, indexes?: readonly IndexOptions[] };
+      readonly schema: { columns: TCols, indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[] };
       hydrate: typeof Entity.hydrate;
     };
   }
