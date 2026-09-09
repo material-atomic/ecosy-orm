@@ -77,6 +77,37 @@ export abstract class Entity {
       }
     }
 
+    /* Composite primary keys are refused here, at declaration, rather than
+       later at CREATE TABLE.
+       
+       The DDL failure is the smaller half. `save()` and `delete()` identify a
+       row through `getPrimaryKeyField()`, which returns ONE column — the first
+       declared. Given a two-column key, `delete()` on a `memberships` row keyed
+       (user_id, project_id) issues `WHERE user_id = ?` and removes that user's
+       membership of every project. No error, no warning, and the row that was
+       asked for does go away, so nothing looks wrong until something counts.
+       
+       So this is not a gap to be filled by emitting a table-level PRIMARY KEY:
+       doing that alone would trade a loud failure at startup for silent data
+       loss at run time. Row identity is single-column all the way through the
+       entity layer, and the schema has to say so.
+       
+       The shape that works: a surrogate key column, plus a unique index over
+       the columns that used to be the key. `upsert(data, conflictColumns)`
+       needs only the unique index, so ON CONFLICT is unaffected. */
+    const primaryKeys = Object.entries(schema.columns).filter(([, opt]) => opt.primaryKey);
+
+    if (primaryKeys.length > 1) {
+      const names = primaryKeys.map(([key]) => key).join(", ");
+      throw new Error(
+        `[Entity] "${entityName}" declares ${primaryKeys.length} primary key columns ` +
+          `(${names}). A row is identified by a single column here — save() and ` +
+          `delete() both filter on one — so a composite key would delete and ` +
+          `overwrite rows that merely share the first column. Use one surrogate ` +
+          `key and a unique index over (${names}); upsert() needs only the index.`,
+      );
+    }
+
     /* Anonymous on purpose: the class is an implementation detail, and what
        the caller keeps is the type below, not this binding. */
     class GeneratedEntity extends Entity {
