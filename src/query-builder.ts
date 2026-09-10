@@ -286,6 +286,30 @@ export class SchemaBuilder {
     return def;
   }
 
+  /**
+   * Whether an existing foreign key already says what the entity declares.
+   *
+   * Both sides are normalised because the two spellings never match literally:
+   * the engine schema-qualifies the target, quotes identifiers, and omits the
+   * clauses that are already the default. An entity that spells a default out
+   * — `ON DELETE NO ACTION` — means the same thing as an entity that leaves it
+   * off, and comparing them raw would put the constraint back into the
+   * drop-and-recreate loop this exists to end.
+   */
+  private normaliseConstraint(text: string) {
+    return text
+      .toUpperCase()
+      .replace(/"/g, "")
+      .replace(/\bPUBLIC\./g, "")
+      .replace(/\s+ON\s+DELETE\s+NO\s+ACTION\b/g, "")
+      .replace(/\s+ON\s+UPDATE\s+NO\s+ACTION\b/g, "")
+      .replace(/\s+MATCH\s+SIMPLE\b/g, "")
+      .replace(/\s+/g, " ")
+      .replace(/\s*\(\s*/g, "(")
+      .replace(/\s*\)\s*/g, ")")
+      .trim();
+  }
+
   private indexStatement(entityName: string, schema: SchemaOptions, idx: any) {
     const unique = idx.unique ? "UNIQUE " : "";
     const cols = idx.columns
@@ -509,11 +533,22 @@ export class SchemaBuilder {
       const current = existingKeys[column];
       const wanted = opt.references ? String(opt.references) : null;
 
-      /* Compared loosely: the engine reports `public.users(id)` for what the
-         schema wrote as `users(id)`. Same constraint, two spellings. */
+      /* Compared as whole definitions, not as target names.
+       *
+       * The first version of this rebuilt `table(column)` from catalog columns
+       * and compared that — which silently threw away `ON DELETE` and
+       * `ON UPDATE`. Every constraint carrying one then looked different from
+       * itself on every boot, so sync dropped and re-added it each time. Not
+       * merely noisy: ADD CONSTRAINT ... FOREIGN KEY takes an ACCESS EXCLUSIVE
+       * lock on both tables and re-validates every row, and between the drop
+       * and the add there is a window with no constraint at all.
+       *
+       * `pg_get_constraintdef` renders the engine's own canonical form, action
+       * clauses included, so the comparison is against what is actually there. */
+      const expected = `FOREIGN KEY (${column}) REFERENCES ${wanted}`;
       const same =
         current && wanted &&
-        current.target.replace(/^[^.]+\./, "").replace(/\s+/g, "") === wanted.replace(/\s+/g, "");
+        this.normaliseConstraint(current.definition) === this.normaliseConstraint(expected);
 
       if (same) continue;
 

@@ -103,15 +103,13 @@ const dialect: Dialect = {
    * `references` could have produced. `confrelid::regclass` gives the target
    * table back in the form the schema writes it.
    */
-  async listForeignKeys(db, table): Promise<Record<string, { name: string; target: string }>> {
+  async listForeignKeys(db, table): Promise<Record<string, { name: string; definition: string }>> {
     const result = await db.query(
       `SELECT c.conname,
               a.attname AS column_name,
-              c.confrelid::regclass::text AS target_table,
-              fa.attname AS target_column
+              pg_get_constraintdef(c.oid) AS definition
          FROM pg_constraint c
-         JOIN pg_attribute a  ON a.attrelid  = c.conrelid  AND a.attnum  = c.conkey[1]
-         JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = c.confkey[1]
+         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
         WHERE c.conrelid = $1::regclass
           AND c.contype = 'f'
           AND array_length(c.conkey, 1) = 1`,
@@ -121,7 +119,7 @@ const dialect: Dialect = {
     return Object.fromEntries(
       result.rows.map((row: any) => [
         row.column_name,
-        { name: row.conname, target: `${row.target_table}(${row.target_column})` },
+        { name: row.conname, definition: row.definition },
       ]),
     );
   },

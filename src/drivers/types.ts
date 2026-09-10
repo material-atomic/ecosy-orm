@@ -113,7 +113,13 @@ export interface Dialect {
   listOwnedIndexes(db: Queryable, table: string): Promise<string[]>;
 
   /**
-   * Foreign keys on this table, as `column -> { name, target }`.
+   * Foreign keys on this table, as `column -> { name, definition }`.
+   *
+   * `definition` is the engine's own full rendering of the constraint —
+   * referenced table and column AND the action clauses. Rebuilding it from
+   * catalog columns instead loses `ON DELETE` and `ON UPDATE`, which makes
+   * every constraint that has one look different from itself on the next
+   * comparison.
    *
    * Keyed by the column that carries it rather than by constraint name,
    * because the entity declares `references` on a column and knows nothing
@@ -127,7 +133,7 @@ export interface Dialect {
   listForeignKeys(
     db: Queryable,
     table: string,
-  ): Promise<Record<string, { name: string; target: string }>>;
+  ): Promise<Record<string, { name: string; definition: string }>>;
 
   /**
    * `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (col) REFERENCES target`.
