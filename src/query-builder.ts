@@ -433,8 +433,15 @@ export class SchemaBuilder {
         await this.connection.query(this.indexStatement(entityName, schema, idx));
       }
 
+      /* Declarations recorded here too, not only on the reconcile path. Without
+         this a freshly created table pays one recreation of every check on its
+         second boot — the self-heal firing for constraints that were never
+         stale, which is the cost this whole mechanism exists to avoid. */
       for (const chk of schema.checks || []) {
         await this.connection.query(this.checkStatement(entityName, chk));
+        if (this.dialect.describeCheck) {
+          await this.connection.query(this.dialect.describeCheck(entityName, chk.name, chk.expression));
+        }
       }
 
       await this.saveSnapshot(entityName, schema);
@@ -625,17 +632,56 @@ export class SchemaBuilder {
 
     const existingChecks = await this.dialect.listChecks(this.connection, entityName);
 
+    /* Whether this engine can keep the declaration beside the constraint. It
+       decides the whole strategy below, so it is read once. */
+    const describe = this.dialect.describeCheck?.bind(this.dialect);
+
     for (const chk of schema.checks || []) {
-      if (!existingChecks[chk.name]) {
+      const existing = existingChecks[chk.name];
+
+      if (!existing) {
         await this.connection.query(this.checkStatement(entityName, chk));
+        if (describe) {
+          await this.connection.query(describe(entityName, chk.name, chk.expression));
+        }
         continue;
       }
 
-      /* The server rewrites a check expression, so it is compared by the
-         identifiers it mentions rather than character by character. */
-      const tokens = chk.expression.match(/[a-zA-Z0-9_]{2,}/g) || [];
-      if (!tokens.every((t: string) => existingChecks[chk.name].includes(t))) {
-        currentLogger().warn(`[DB] Recreating check constraint ${chk.name} on ${entityName}.`);
+      /* Compared against what the entity DECLARED last time, never against what
+       * the engine stored.
+       *
+       * The engine rewrites a check into its own canonical form: `IN (…)` comes
+       * back as `= ANY (ARRAY[…])`, `BETWEEN` as two comparisons. The previous
+       * version of this compared the declared expression's identifiers against
+       * that rewritten text, so the words `IN` and `BETWEEN` were never found —
+       * and every constraint written with either was dropped and recreated on
+       * every single boot. A check using only `AND`, `OR` and `IS NULL`, which
+       * the engine leaves alone, was the one kind that stayed quiet.
+       *
+       * There is no normalisation that fixes this, in either direction. So the
+       * declaration is stored verbatim and compared as a string, and nothing is
+       * normalised because nothing needs to be.
+       */
+      if (!describe) {
+        /* No way to record a declaration, so no honest comparison exists.
+           Leaving the constraint alone is the conservative half of the choice —
+           recreating it on a guess is what this replaced. */
+        continue;
+      }
+
+      const changed = existing.declared === null
+        ? true   /* Created before declarations were recorded. Recreate once to
+                    write one, and this branch never runs for it again. */
+        : existing.declared.trim() !== chk.expression.trim();
+
+      if (changed) {
+        currentLogger().warn(
+          existing.declared === null
+            ? `[DB] Recreating check constraint ${chk.name} on ${entityName} once, to record ` +
+              `what it was declared from.`
+            : `[DB] Recreating check constraint ${chk.name} on ${entityName} — the entity ` +
+              `changed it.`,
+        );
 
         /* Added under a temporary name first, then swapped. Dropping first
            leaves a window with no constraint at all, and if the new one is
@@ -675,6 +721,8 @@ export class SchemaBuilder {
           `ALTER TABLE ${table} RENAME CONSTRAINT ${this.dialect.quote(staging)} ` +
             `TO ${this.dialect.quote(chk.name)}`,
         );
+
+        await this.connection.query(describe(entityName, chk.name, chk.expression));
       }
     }
 

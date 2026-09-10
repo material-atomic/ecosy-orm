@@ -129,6 +129,10 @@ const dialect: Dialect = {
     `FOREIGN KEY (${dialect.quote(column)}) REFERENCES ${target}` +
     (validate ? "" : " NOT VALID"),
 
+  describeCheck: (table, name, expression) =>
+    `COMMENT ON CONSTRAINT ${dialect.quote(name)} ON ${dialect.quote(table)} ` +
+    `IS '${expression.replace(/'/g, "''")}'`,
+
   dropForeignKey: (table, name) =>
     `ALTER TABLE ${dialect.quote(table)} DROP CONSTRAINT ${dialect.quote(name)}`,
 
@@ -168,13 +172,28 @@ const dialect: Dialect = {
   },
 
   async listChecks(db, table) {
+    /* `pg_description` carries what the entity declared, put there by
+       `describeCheck` when the constraint was created. `pg_get_constraintdef`
+       is the engine's rewritten form, kept for error messages — never for
+       deciding whether anything changed. */
     const result = await db.query(
-      `SELECT conname, pg_get_constraintdef(oid) AS condef
-         FROM pg_constraint
-        WHERE conrelid = $1::regclass AND contype = 'c'`,
+      `SELECT c.conname,
+              pg_get_constraintdef(c.oid) AS condef,
+              d.description AS declared
+         FROM pg_constraint c
+         LEFT JOIN pg_description d
+           ON d.objoid = c.oid
+          AND d.classoid = 'pg_constraint'::regclass
+        WHERE c.conrelid = $1::regclass AND c.contype = 'c'`,
       [table],
     );
-    return Object.fromEntries(result.rows.map((row: any) => [row.conname, row.condef]));
+
+    return Object.fromEntries(
+      result.rows.map((row: any) => [
+        row.conname,
+        { definition: row.condef, declared: row.declared ?? null },
+      ]),
+    );
   },
 };
 

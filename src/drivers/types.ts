@@ -102,7 +102,29 @@ export interface Dialect {
   /** Index name to its definition, for deciding whether one has to be rebuilt. */
   listIndexes(db: Queryable, table: string): Promise<Record<string, string>>;
   /** Check-constraint name to its expression. */
-  listChecks(db: Queryable, table: string): Promise<Record<string, string>>;
+  listChecks(
+    db: Queryable,
+    table: string,
+  ): Promise<Record<string, { definition: string; declared: string | null }>>;
+
+  /**
+   * Records, next to the constraint, the expression the entity declared.
+   *
+   * The engine stores a check in its own canonical form — `IN (...)` comes back
+   * as `= ANY (ARRAY[...])`, `BETWEEN` as two comparisons — and there is no way
+   * to normalise the author's spelling forward into that form, nor the stored
+   * form back. Comparing them at all is guesswork, and guessing wrong means
+   * dropping and recreating the constraint on every boot.
+   *
+   * So the declaration is kept verbatim beside the constraint, and the
+   * comparison is string equality against what was declared last time. Nothing
+   * is normalised because nothing needs to be.
+   *
+   * Optional. An engine that cannot annotate a constraint leaves it undefined,
+   * and sync then leaves existing checks alone rather than recreating them on a
+   * comparison it cannot make.
+   */
+  describeCheck?(table: string, name: string, expression: string): string;
   /**
    * Indexes this table has that no constraint owns.
    *
