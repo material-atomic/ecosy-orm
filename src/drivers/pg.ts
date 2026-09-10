@@ -89,6 +89,45 @@ const dialect: Dialect = {
   /* Indexes that exist in their own right. One backing a primary key or a
      unique constraint belongs to that constraint and is dropped with it, never
      on its own. */
+  /**
+   * Single-column foreign keys, keyed by the column that carries them.
+   *
+   * `conkey` is the array of column numbers the constraint covers, so
+   * `array_length(conkey, 1) = 1` keeps this to the ones a column-level
+   * `references` could have produced. `confrelid::regclass` gives the target
+   * table back in the form the schema writes it.
+   */
+  async listForeignKeys(db, table): Promise<Record<string, { name: string; target: string }>> {
+    const result = await db.query(
+      `SELECT c.conname,
+              a.attname AS column_name,
+              c.confrelid::regclass::text AS target_table,
+              fa.attname AS target_column
+         FROM pg_constraint c
+         JOIN pg_attribute a  ON a.attrelid  = c.conrelid  AND a.attnum  = c.conkey[1]
+         JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = c.confkey[1]
+        WHERE c.conrelid = $1::regclass
+          AND c.contype = 'f'
+          AND array_length(c.conkey, 1) = 1`,
+      [table],
+    );
+
+    return Object.fromEntries(
+      result.rows.map((row: any) => [
+        row.column_name,
+        { name: row.conname, target: `${row.target_table}(${row.target_column})` },
+      ]),
+    );
+  },
+
+  addForeignKey: (table, column, target, name, validate = true) =>
+    `ALTER TABLE ${dialect.quote(table)} ADD CONSTRAINT ${dialect.quote(name)} ` +
+    `FOREIGN KEY (${dialect.quote(column)}) REFERENCES ${target}` +
+    (validate ? "" : " NOT VALID"),
+
+  dropForeignKey: (table, name) =>
+    `ALTER TABLE ${dialect.quote(table)} DROP CONSTRAINT ${dialect.quote(name)}`,
+
   async listOwnedIndexes(db, table): Promise<string[]> {
     const result = await db.query(
       `SELECT i.indexname

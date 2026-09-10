@@ -95,6 +95,41 @@ export interface Dialect {
    * which indexes are its own to remove before it removes any.
    */
   listOwnedIndexes(db: Queryable, table: string): Promise<string[]>;
+
+  /**
+   * Foreign keys on this table, as `column -> { name, target }`.
+   *
+   * Keyed by the column that carries it rather than by constraint name,
+   * because the entity declares `references` on a column and knows nothing
+   * about what the engine chose to call the constraint.
+   *
+   * A composite foreign key spans several columns and has no single carrier,
+   * so it is not reported here — the column-level `references` in a schema
+   * cannot express one either, and reporting half of it would invite sync to
+   * "fix" a constraint it does not understand.
+   */
+  listForeignKeys(
+    db: Queryable,
+    table: string,
+  ): Promise<Record<string, { name: string; target: string }>>;
+
+  /**
+   * `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY (col) REFERENCES target`.
+   *
+   * `validate: false` adds it unvalidated where the engine allows it, so rows
+   * already there are left alone and everything written from now on is
+   * checked — the same escape the check constraints use.
+   */
+  addForeignKey(
+    table: string,
+    column: string,
+    target: string,
+    name: string,
+    validate?: boolean,
+  ): string;
+
+  /** `ALTER TABLE ... DROP CONSTRAINT`. */
+  dropForeignKey(table: string, name: string): string;
   /** Drops a column, with whatever it held. */
   dropColumn(table: string, column: string): string;
   /** Renames a column, keeping what it holds. */

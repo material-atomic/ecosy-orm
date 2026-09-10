@@ -486,6 +486,74 @@ export class SchemaBuilder {
       delete existingCols[name];
     }
 
+    /* Foreign keys.
+     *
+     * Until now a `references` only ever reached the database if the column
+     * carrying it was BORN with it — inline in CREATE TABLE, or inline in ADD
+     * COLUMN. Adding `references` to a column that already existed did
+     * nothing, changing it did nothing, and removing it left the constraint in
+     * place for good. Nothing said so; the schema simply stopped being a
+     * description of the database.
+     *
+     * Scoped deliberately to columns the entity declares. A foreign key on a
+     * column this entity knows nothing about is left alone — unlike the check
+     * constraints below, which drop anything undeclared. The asymmetry is on
+     * purpose: a check dropped by mistake stops rejecting bad rows, while a
+     * foreign key dropped by mistake surrenders referential integrity, and the
+     * damage is already done by the time anyone notices.
+     */
+    const existingKeys = await this.dialect.listForeignKeys(this.connection, entityName);
+
+    for (const opt of Object.values(schema.columns) as any[]) {
+      const column = String(opt.name);
+      const current = existingKeys[column];
+      const wanted = opt.references ? String(opt.references) : null;
+
+      /* Compared loosely: the engine reports `public.users(id)` for what the
+         schema wrote as `users(id)`. Same constraint, two spellings. */
+      const same =
+        current && wanted &&
+        current.target.replace(/^[^.]+\./, "").replace(/\s+/g, "") === wanted.replace(/\s+/g, "");
+
+      if (same) continue;
+
+      if (current) {
+        currentLogger().warn(
+          `[DB] Dropping foreign key ${current.name} on ${entityName}.${column} — ` +
+            (wanted
+              ? `the entity now points it at ${wanted}.`
+              : `the entity no longer declares one.`),
+        );
+        await this.connection.query(this.dialect.dropForeignKey(entityName, current.name));
+      }
+
+      if (!wanted) continue;
+
+      /* Postgres names an inline REFERENCES `<table>_<column>_fkey`, so using
+         the same shape here means a constraint created at CREATE TABLE and one
+         created by this loop are indistinguishable afterwards. */
+      const name = `${entityName}_${column}_fkey`;
+
+      try {
+        await this.connection.query(this.dialect.addForeignKey(entityName, column, wanted, name));
+      } catch (error) {
+        /* Rows already there point at nothing. Same reasoning as an unsatisfied
+           check: the schema has moved on, and what the constraint is for is
+           everything written from now on. */
+        if (!this.dialect.supportsUnvalidatedCheck) throw error;
+
+        await this.connection.query(
+          this.dialect.addForeignKey(entityName, column, wanted, name, false),
+        );
+
+        currentLogger().warn(
+          `[DB] ${entityName}.${column} references ${wanted} NOT VALID: existing rows do not ` +
+            `all resolve. New writes are checked; fix the orphans and run VALIDATE CONSTRAINT ` +
+            `${name} to finish.`,
+        );
+      }
+    }
+
     const existingIndexes = await this.dialect.listIndexes(this.connection, entityName);
 
     for (const idx of schema.indexes || []) {
