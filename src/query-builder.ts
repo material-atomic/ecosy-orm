@@ -463,10 +463,13 @@ export class SchemaBuilder {
       delete existingCols[from];
     }
 
+    const added: string[] = [];
+
     for (const [, opt] of Object.entries(schema.columns)) {
       const dbCol = opt.name as string;
 
       if (!existingCols[dbCol]) {
+        added.push(dbCol);
         await this.connection.query(
           `ALTER TABLE ${table} ADD COLUMN ${this.columnDefinition(opt, false)}`,
         );
@@ -511,6 +514,24 @@ export class SchemaBuilder {
 
     for (const name of Object.keys(existingCols)) {
       if (declared.has(name)) continue;
+
+      /* One column gone and another arrived in the same sync is what a rename
+         looks like from here. Telling them apart needs the snapshot, which is
+         off unless a project asked for it — so without it this drop may be
+         throwing away the data a rename was meant to carry across, and the log
+         is the only place that can say so.
+
+         Worth saying out loud because the feature that prevents it is
+         documented as existing while being, for most projects, not switched
+         on: reading that it exists is not the same as it running. */
+      if (!this.sync.snapshot && added.length) {
+        currentLogger().warn(
+          `[DB] ${entityName}.${name} is being dropped while ${added.join(", ")} ` +
+            `${added.length === 1 ? "was" : "were"} added. If that is a rename, the data is ` +
+            `about to be lost — sync cannot tell a rename from a drop-and-add without ` +
+            `\`sync: { snapshot: true }\` on the driver, which is off by default.`,
+        );
+      }
 
       currentLogger().warn(`[DB] Dropping ${entityName}.${name} — the entity no longer declares it.`);
       await this.connection.query(this.dialect.dropColumn(entityName, name));
