@@ -20,6 +20,12 @@ const dialect: Dialect = {
   supportsReturning: true,
   supportsUnvalidatedCheck: true,
 
+  /* `hashtext` maps the name onto the bigint the lock functions take, so
+     callers name a lock instead of inventing a number and hoping nobody else
+     picked it. */
+  advisoryLock: (key) => `SELECT pg_advisory_lock(hashtext('${key.replace(/'/g, "''")}'))`,
+  advisoryUnlock: (key) => `SELECT pg_advisory_unlock(hashtext('${key.replace(/'/g, "''")}'))`,
+
   upsertClause: (conflictColumns, updateColumns) => {
     const target = conflictColumns.map((c) => dialect.quote(c)).join(", ");
 

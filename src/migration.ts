@@ -4,27 +4,27 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { DataSource } from "./data-source";
+import { SchemaBuilder } from "./query-builder";
+import { currentLogger } from "./logger";
 
 const connection = new DataSource();
 
-async function checkConnection() {
-  try {
-    await connection.query("SELECT 1");
-    return true;
-  } catch (error) {
-    currentLogger().error("[DB] Connection failed:", error);
-    return false;
-  }
-}
-
+/**
+ * Creates the table that records which files have run.
+ *
+ * No surrogate id. The file name IS the key — it was already `UNIQUE NOT NULL`,
+ * and the `SERIAL` beside it was never read by anything. Dropping it also drops
+ * the only Postgres-specific word in the statement.
+ */
 async function ensureTrackingTable(tableName: string) {
-  await connection.query(`
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id SERIAL PRIMARY KEY,
-      name VARCHAR(255) UNIQUE NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  const q = (name: string) => DataSource.dialect.quote(name);
+
+  await connection.query(
+    `CREATE TABLE IF NOT EXISTS ${q(tableName)} (
+       ${q("name")} TEXT PRIMARY KEY,
+       ${q("created_at")} TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+     )`,
+  );
 }
 
 async function runSqlFiles(dirPath: string, trackingTable: string) {
@@ -47,35 +47,94 @@ async function runSqlFiles(dirPath: string, trackingTable: string) {
 
   if (sqlFiles.length === 0) return;
 
-  const result = await connection.query(`SELECT name FROM ${trackingTable}`);
+  const result = await connection.query(`SELECT name FROM ${DataSource.dialect.quote(trackingTable)}`);
   const executedFiles = new Set(result.rows.map(row => row.name));
 
   for (const file of sqlFiles) {
-    if (!executedFiles.has(file)) {
-      currentLogger().info(`[DB] Running ${trackingTable}: ${file}...`);
-      const filePath = path.join(dirPath, file);
-      const sql = await fs.readFile(filePath, "utf-8");
+    if (executedFiles.has(file)) continue;
 
-      try {
-        await connection.query("BEGIN");
-        await connection.query(sql);
-        await connection.query(`INSERT INTO ${trackingTable} (name) VALUES ($1)`, [file]);
-        await connection.query("COMMIT");
-        currentLogger().info(`[DB] Successfully ran ${file}`);
-      } catch (error) {
-        await connection.query("ROLLBACK");
-        currentLogger().error(`[DB] Failed to run ${file}:`, error);
-        /* Stop at the first failure. Carrying on would run later migrations
-           against a schema the failed one was supposed to produce, turning one
-           readable error into a series of unrelated ones. */
-        throw error;
-      }
+    currentLogger().info(`[DB] Running ${trackingTable}: ${file}...`);
+    const sql = await fs.readFile(path.join(dirPath, file), "utf-8");
+
+    try {
+      /* One transaction, on ONE connection.
+       *
+       * This used to be four separate `connection.query` calls — BEGIN, the
+       * migration, the INSERT, COMMIT — and `connection.query` goes through the
+       * pool, which hands out whichever connection is free per statement. So
+       * BEGIN could open a transaction on one connection and see it returned to
+       * the pool still open, the migration could run on a second in autocommit,
+       * and COMMIT could land on a third with nothing to commit.
+       *
+       * It looked fine forever, because a quiet pool keeps handing back the same
+       * connection. Under concurrency it comes apart, and the way it comes apart
+       * is the worst available: the schema change applies but the tracking row
+       * does not, so the next boot runs the file again and fails on `already
+       * exists`.
+       *
+       * `transaction()` keeps one connection checked out for the whole callback.
+       */
+      await DataSource.transaction(async (tx) => {
+        await tx.query(sql);
+        await tx.query(
+          `INSERT INTO ${DataSource.dialect.quote(trackingTable)} (${DataSource.dialect.quote("name")}) ` +
+            `VALUES (${DataSource.dialect.placeholder(1)})`,
+          [file],
+        );
+      });
+
+      currentLogger().info(`[DB] Successfully ran ${file}`);
+    } catch (error) {
+      currentLogger().error(`[DB] Failed to run ${file}:`, error);
+      /* Stop at the first failure. Carrying on would run later migrations
+         against a schema the failed one was supposed to produce, turning one
+         readable error into a series of unrelated ones. */
+      throw error;
     }
   }
 }
 
-import { SchemaBuilder } from "./query-builder";
-import { currentLogger } from "./logger";
+/**
+ * Runs `fn` while holding a named lock, so two processes booting at once do not
+ * both decide the same migration has not run yet.
+ *
+ * The lock is taken on a connection this function keeps checked out, because an
+ * advisory lock belongs to a session: taking it through a pooled query would
+ * return the connection — and release the lock — before the work even starts.
+ * That is the same mistake the migration loop above used to make, in a
+ * different costume.
+ *
+ * An engine whose dialect declares no advisory lock runs unguarded, and says so
+ * rather than implying a protection it does not have.
+ */
+async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const dialect = DataSource.dialect;
+
+  if (!dialect.advisoryLock || !dialect.advisoryUnlock) {
+    currentLogger().warn(
+      `[DB] Driver "${DataSource.current.name}" exposes no advisory lock, so migrations run ` +
+        `unguarded. Two processes booting together may run the same file twice.`,
+    );
+    return fn();
+  }
+
+  const holder = await DataSource.transaction();
+
+  try {
+    await holder.query(dialect.advisoryLock(key));
+    return await fn();
+  } finally {
+    /* Commit releases the connection, and the session lock with it; the unlock
+       is explicit anyway so the intent survives a future change to how the
+       transaction is closed. */
+    try {
+      await holder.query(dialect.advisoryUnlock(key));
+    } catch {
+      /* Losing the unlock is not worth masking whatever `fn` threw. */
+    }
+    await holder.commit();
+  }
+}
 
 export async function syncEntities(entityClasses: any[]) {
   currentLogger().info("[DB] Syncing schemas from entities...");
@@ -93,15 +152,43 @@ export async function syncEntities(entityClasses: any[]) {
   }
 }
 
-export async function initDatabase() {
-  const isConnected = await checkConnection();
-  if (!isConnected) return;
+export interface InitDatabaseOptions {
+  /** Directory of numbered `.sql` migrations. Default: `migrations` under the working directory. */
+  migrations?: string;
+  /** Directory of `.sql` seeds. Default: `seeds` under the working directory. */
+  seeds?: string;
+}
 
-  currentLogger().info("[DB] Connected. Checking migrations...");
-  const migrationsDir = path.join(process.cwd(), "src/core/db/migrations");
-  await runSqlFiles(migrationsDir, "_migrations");
+/**
+ * Applies migrations, then seeds.
+ *
+ * Both directories are arguments. They used to be hardcoded — and to two
+ * different conventions, `src/core/db/migrations` against a bare `seeds` —
+ * which made a library impose one project's folder layout on every other. The
+ * defaults are still relative to `process.cwd()`, which is worth knowing about:
+ * under a Next.js `output: "standalone"` build, that is wherever the process
+ * was started from, not the repository root. Pass absolute paths when the
+ * answer has to be certain.
+ */
+export async function initDatabase(options: InitDatabaseOptions = {}) {
+  /* A failed connection used to `return` here, so a database that was not ready
+     produced a silent success: the app booted on an unmigrated schema and the
+     real error surfaced somewhere far away, wearing a different name. */
+  try {
+    await connection.query("SELECT 1");
+  } catch (error) {
+    currentLogger().error("[DB] Connection failed; migrations did not run.", error);
+    throw error;
+  }
 
-  currentLogger().info("[DB] Checking seeds...");
-  const seedsDir = path.join(process.cwd(), "seeds");
-  await runSqlFiles(seedsDir, "_seeds");
+  const migrationsDir = options.migrations ?? path.join(process.cwd(), "migrations");
+  const seedsDir = options.seeds ?? path.join(process.cwd(), "seeds");
+
+  await withLock("ecosy:orm:migrate", async () => {
+    currentLogger().info("[DB] Connected. Checking migrations...");
+    await runSqlFiles(migrationsDir, "_migrations");
+
+    currentLogger().info("[DB] Checking seeds...");
+    await runSqlFiles(seedsDir, "_seeds");
+  });
 }

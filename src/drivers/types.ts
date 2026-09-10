@@ -66,6 +66,22 @@ export interface Dialect {
   readonly supportsUnvalidatedCheck: boolean;
 
   /**
+   * A lock two processes can contend for by name, held for as long as the
+   * connection that took it stays open.
+   *
+   * Optional: an engine without one leaves both undefined, and the caller says
+   * out loud that concurrent runs are unguarded rather than pretending they are
+   * not.
+   *
+   * The lock lives on a CONNECTION, so it only guards work done on that same
+   * connection's session. Taking it through a pooled query and then working
+   * elsewhere guards nothing — the connection goes back to the pool and the
+   * lock with it.
+   */
+  advisoryLock?(key: string): string;
+  advisoryUnlock?(key: string): string;
+
+  /**
    * The upsert tail.
    *
    * Both halves differ by engine, not just the keyword: Postgres names the
