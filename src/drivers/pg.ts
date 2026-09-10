@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { currentLogger } from "../logger";
 import type { PoolConfig } from "pg";
 import type { PartialInput } from "../optional";
 import type {
@@ -222,10 +223,63 @@ export interface PgDriverConfig extends PartialInput<PoolConfig> {
   sync?: SyncOptions | undefined;
 }
 
+
+/**
+ * A one-line, password-free description of where a config points.
+ *
+ * Falls back to naming the defaults rather than printing blanks: "wherever
+ * node-postgres defaults to" is the fact that explains a connection to
+ * localhost nobody asked for, and blanks would hide it.
+ */
+function describeTarget(config: Record<string, unknown>): string {
+  const url = typeof config.connectionString === "string" ? config.connectionString : "";
+
+  if (url) {
+    try {
+      const parsed = new URL(url);
+      const database = parsed.pathname.replace(/^\//, "") || "?";
+      return `${parsed.hostname}:${parsed.port || "5432"}/${database} as ${parsed.username || "?"}`;
+    } catch {
+      return "a connection string that does not parse as a URL";
+    }
+  }
+
+  if (config.host || config.database || config.user) {
+    return `${String(config.host ?? "?")}:${String(config.port ?? "?")}/` +
+      `${String(config.database ?? "?")} as ${String(config.user ?? "?")}`;
+  }
+
+  return "wherever node-postgres defaults to — nothing here named a host";
+}
+
 export function PgDriver(config: PgDriverConfig): Driver {
   /* Split before the rest reaches `new Pool()`, which is handed the object
      untouched and would carry an option it knows nothing about. */
   const { sync = {}, ...poolConfig } = config;
+
+  /* An empty `connectionString` is not the same as no `connectionString`.
+   *
+   * Omitting it says "I am configuring by host and user". Passing an empty one
+   * says "I read a URL from somewhere and got nothing" — and node-postgres
+   * treats the two identically: anything falsy is ignored, the discrete fields
+   * take over, and whatever they do not supply comes from PG* environment
+   * variables and then from defaults ending at localhost:5432.
+   *
+   * So a missing DATABASE_URL becomes a connection attempt to the process's own
+   * machine, and the error names 127.0.0.1 — a place that has nothing to do
+   * with the mistake. In a container it is worse: localhost is the container,
+   * so the report is about a host that could never have been right.
+   *
+   * The key being present is the evidence that a URL was expected. Refusing
+   * here costs nothing and puts the message where the cause is. */
+  if ("connectionString" in poolConfig && !String(poolConfig.connectionString ?? "").trim()) {
+    throw new Error(
+      "[PgDriver] `connectionString` was given but is empty — the value it was read " +
+        "from is unset. Leave the option out entirely to configure by host, user, " +
+        "password, database and port instead; passing it empty falls through to " +
+        "localhost, which is almost never what was meant.",
+    );
+  }
   /* Held on globalThis under a Symbol so a hot reload reuses the pool instead
      of opening a second one and quietly doubling the connection count. */
   const POOL = Symbol.for("@ecosy/orm:pg-pool");
@@ -247,7 +301,21 @@ export function PgDriver(config: PgDriverConfig): Driver {
       if (global[POOL]) return;
 
       const { Pool } = await import("pg");
-      global[POOL] = new Pool(poolConfig as PoolConfig);
+      const created = new Pool(poolConfig as PoolConfig);
+
+      /* Says what was configured, which is the thing worth seeing in a log at
+         startup: a connection that was never told where to go announces itself
+         here, instead of only in a refused-connection error naming an address
+         nobody chose.
+
+         Read from the config rather than from the pool: `Pool.options` keeps
+         what it was handed, not what node-postgres resolves — a URL is parsed
+         per client, so asking the pool would report nothing at all. Where the
+         config says nothing either, the honest answer is that the defaults
+         decide, and the line says so. */
+      currentLogger().info(`[PgDriver] connecting to ${describeTarget(poolConfig)}`);
+
+      global[POOL] = created;
     },
 
     async end() {
