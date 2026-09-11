@@ -52,6 +52,36 @@ const dialect: Dialect = {
     `ALTER TABLE ${dialect.quote(table)} ALTER COLUMN ${dialect.quote(column)} ` +
     `${notNull ? "SET" : "DROP"} NOT NULL`,
 
+  /* Catalogue-only: neither form rewrites the table or touches a row. A new
+     default applies to later writes; rows already NULL are filled by sync's
+     tighten phase, not by this. */
+  alterDefault: (table, column, expression) =>
+    `ALTER TABLE ${dialect.quote(table)} ALTER COLUMN ${dialect.quote(column)} ` +
+    (expression === null ? "DROP DEFAULT" : `SET DEFAULT ${expression}`),
+
+  /* A throwaway table with the declared defaults on columns of the declared
+     types, read back through the same pg_get_expr that fills
+     information_schema.columns.column_default. Same function, same type
+     context, so equal declarations render equal. ON COMMIT DROP keeps it from
+     outliving the transaction the caller holds it in. */
+  async renderDefaults(db, defaults) {
+    if (!defaults.length) return [];
+    const probe = "_ecosy_default_probe";
+    await db.query(
+      `CREATE TEMP TABLE ${probe} (` +
+        defaults.map((d, i) => `c${i} ${d.type} DEFAULT ${d.expression}`).join(", ") +
+        `) ON COMMIT DROP`,
+    );
+    const result = await db.query(
+      `SELECT pg_get_expr(d.adbin, d.adrelid) AS expr
+         FROM pg_attrdef d
+         JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+        WHERE d.adrelid = 'pg_temp.${probe}'::regclass
+        ORDER BY a.attnum`,
+    );
+    return result.rows.map((row: any) => String(row.expr));
+  },
+
   /**
    * Both lookups are scoped to the search path.
    *
@@ -76,7 +106,7 @@ const dialect: Dialect = {
 
   async listColumns(db, table): Promise<ColumnInfo[]> {
     const result = await db.query(
-      `SELECT column_name, is_nullable, data_type,
+      `SELECT column_name, is_nullable, data_type, column_default,
               character_maximum_length, numeric_precision, numeric_scale
          FROM information_schema.columns
         WHERE table_name = $1
@@ -86,6 +116,7 @@ const dialect: Dialect = {
     return result.rows.map((row: any) => ({
       name: row.column_name,
       nullable: row.is_nullable === "YES",
+      default: row.column_default ?? null,
       type: String(row.data_type),
       length: row.character_maximum_length ?? null,
       precision: row.numeric_precision ?? null,

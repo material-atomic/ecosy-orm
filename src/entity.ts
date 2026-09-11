@@ -60,6 +60,23 @@ export abstract class Entity {
    * entity. A hook that only some call sites trigger is a rule only some call
    * sites follow, which is the problem hooks exist to remove.
    *
+   * **What that promise does not cover: rows the database changes itself.** A
+   * foreign key declared `ON DELETE CASCADE` deletes this entity's rows when
+   * the row they reference goes, and Postgres does it — the ORM issues no
+   * statement, so `beforeRemove` and `afterRemove` never run. Deleting a
+   * project that cascades to its messages bypasses every hook on the message
+   * entity, silently. `ON DELETE SET NULL`, `SET DEFAULT` and `ON UPDATE
+   * CASCADE` do the same to `beforeUpdate` and `afterUpdate`. Nothing at this
+   * layer can intercept that.
+   *
+   * Sync warns when an entity declares one of those hooks and a foreign key in
+   * its own `references` that bypasses it. A hook that must hold on every
+   * path — refusing to delete a message, say — cannot rely on the cascade:
+   * drop it for `ON DELETE RESTRICT` and delete children through the
+   * repository, or enforce the rule in the database with a trigger. Keys
+   * created in hand-written SQL, and rows changed by hand-written SQL, are
+   * outside what sync can see.
+   *
    * `upsert()` runs `beforeInsert` but no after-hook: the statement does not
    * say, per row, whether it inserted or updated, and guessing would run the
    * wrong one.

@@ -5,6 +5,7 @@ import type { FindOptions, FindWhereOptions, ObjectWhere, SchemaOptions } from "
 import type { Entity as BaseEntity } from "./entity";
 import type { ColumnInfo, Dialect, Queryable, SyncOptions } from "./drivers/types";
 import { currentDialect, currentDriver } from "./drivers/current";
+import { DataSource } from "./data-source";
 
 
 export class QueryBuilder<Entity extends BaseEntity> {
@@ -484,6 +485,141 @@ export class SchemaBuilder {
   }
 
   /**
+   * Brings the defaults of existing columns in line with the entity.
+   *
+   * Compared by rendering, not by text. Postgres rewrites a default when it
+   * stores it — `'html'` comes back `'html'::text` — so a textual comparison
+   * would set every such default again on every boot. Declarations that
+   * already match textually cost nothing; the rest are rendered by the engine
+   * in one go and compared rendering to rendering.
+   *
+   * Serial columns are left alone either way: their default is the sequence,
+   * which the entity states through the type, not through `default`.
+   */
+  private async reconcileDefaults(
+    entityName: string,
+    columns: { dbCol: string; opt: any; current: string | null }[],
+  ) {
+    if (!this.dialect.alterDefault) return;
+
+    const serial = (opt: any) => /SERIAL$/i.test(String(opt.type).trim());
+    const toSet: { dbCol: string; expression: string }[] = [];
+    const toCompare: { dbCol: string; opt: any; current: string; declared: string }[] = [];
+
+    for (const { dbCol, opt, current } of columns) {
+      if (serial(opt)) continue;
+      const declared = opt.default === undefined || opt.default === null ? null : String(opt.default).trim();
+
+      if (declared === null) {
+        if (current === null || /^nextval\(/i.test(current)) continue;
+        currentLogger().warn(`[DB] Dropping the default of ${entityName}.${dbCol} — the entity no longer declares one.`);
+        await this.connection.query(this.dialect.alterDefault(entityName, dbCol, null));
+        continue;
+      }
+
+      if (current === null) toSet.push({ dbCol, expression: declared });
+      else if (current !== declared) toCompare.push({ dbCol, opt, current, declared });
+    }
+
+    if (toCompare.length && this.dialect.renderDefaults) {
+      const render = this.dialect.renderDefaults.bind(this.dialect);
+      const rendered = await DataSource.transaction((tx) =>
+        render(tx, toCompare.map((c) => ({ type: String(c.opt.type), expression: c.declared }))),
+      );
+      toCompare.forEach((c, i) => {
+        if (rendered[i] !== c.current) toSet.push({ dbCol: c.dbCol, expression: c.declared });
+      });
+    }
+
+    for (const { dbCol, expression } of toSet) {
+      currentLogger().info(`[DB] Setting the default of ${entityName}.${dbCol} to ${expression}.`);
+      await this.connection.query(this.dialect.alterDefault(entityName, dbCol, expression));
+    }
+  }
+
+  /**
+   * `UPDATE … SET col = DEFAULT WHERE col IS NULL`, retried on a unique
+   * collision.
+   *
+   * The default is evaluated per row, so a random one gives every row its
+   * own value — and on a unique column two of them can still meet, or meet a
+   * value already stored. The statement is atomic, so a collision leaves
+   * nothing half-written and running it again draws fresh values. Five
+   * attempts: at the sizes a boot-time fill runs at, a random default that
+   * collides five times running is not a random default.
+   */
+  private async fillFromDefault(entityName: string, dbCol: string, unique: boolean) {
+    const sql =
+      `UPDATE ${this.dialect.quote(entityName)} SET ${this.dialect.quote(dbCol)} = DEFAULT ` +
+      `WHERE ${this.dialect.quote(dbCol)} IS NULL`;
+    const attempts = unique ? 5 : 1;
+
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.connection.query(sql);
+        return;
+      } catch (error: any) {
+        if (error?.code !== "23505" || attempt >= attempts) {
+          if (error?.code === "23505") {
+            throw new Error(
+              `[DB] Filling ${entityName}.${dbCol} from its default collided with an existing ` +
+                `value ${attempts} times running. Its default cannot produce enough distinct ` +
+                `values for a unique column — widen it, or fill these rows from an effect.`,
+              { cause: error },
+            );
+          }
+          throw error;
+        }
+        currentLogger().warn(`[DB] ${entityName}.${dbCol}: default collided on a unique value, retrying (${attempt}/${attempts}).`);
+      }
+    }
+  }
+
+  /**
+   * Says so when the database itself will change this entity's rows behind
+   * its hooks.
+   *
+   * `ON DELETE CASCADE` deletes rows of this table when a referenced row goes,
+   * and Postgres does it — the ORM never issues a statement, so beforeRemove
+   * and afterRemove never run. `SET NULL`, `SET DEFAULT` and `ON UPDATE
+   * CASCADE` do the same to the update hooks. Nothing here can stop that; what
+   * sync can do is read the foreign keys the entity declares and say it out
+   * loud when a hook it also declares is about to be bypassed.
+   *
+   * Only for keys declared in `references`. A cascade created by hand in SQL
+   * is invisible from here, and so is a row changed by hand-written SQL.
+   */
+  private warnHookBypass(entityName: string, schema: SchemaOptions, EntityClass: unknown) {
+    const proto = (EntityClass as { prototype?: Record<string, unknown> } | undefined)?.prototype;
+    if (!proto) return;
+    const declares = (...hooks: string[]) => hooks.filter((h) => typeof proto[h] === "function");
+
+    const removeHooks = declares("beforeRemove", "afterRemove");
+    const updateHooks = declares("beforeUpdate", "afterUpdate");
+    if (!removeHooks.length && !updateHooks.length) return;
+
+    for (const opt of Object.values(schema.columns) as any[]) {
+      const ref = String(opt.references ?? "");
+      if (!ref) continue;
+
+      if (removeHooks.length && /ON\s+DELETE\s+CASCADE/i.test(ref)) {
+        currentLogger().warn(
+          `[DB] ${entityName} declares ${removeHooks.join(" and ")}, but ${entityName}.${opt.name} ` +
+            `references ${ref}: rows removed by that cascade are deleted by the database, and no ` +
+            `hook sees them.`,
+        );
+      }
+      if (updateHooks.length && /ON\s+(DELETE\s+SET\s+(NULL|DEFAULT)|UPDATE\s+(CASCADE|SET\s+(NULL|DEFAULT)))/i.test(ref)) {
+        currentLogger().warn(
+          `[DB] ${entityName} declares ${updateHooks.join(" and ")}, but ${entityName}.${opt.name} ` +
+            `references ${ref}: rows that action changes are changed by the database, and no ` +
+            `hook sees them.`,
+        );
+      }
+    }
+  }
+
+  /**
    * Brings one table in line with its entity.
    *
    * On an existing table the work runs in three phases, and the order is the
@@ -536,6 +672,7 @@ export class SchemaBuilder {
          effect still runs — and is recorded — here, so it does not wait for a
          later boot to find data it was never meant for. */
       await runEffects();
+      this.warnHookBypass(entityName, schema, EntityClass);
 
       return;
     }
@@ -557,6 +694,8 @@ export class SchemaBuilder {
     const added: string[] = [];
     /* Columns that must become NOT NULL once the effects have had their turn. */
     const tighten: { dbCol: string; opt: any }[] = [];
+    /* Existing columns, for reconciling their defaults after the loop. */
+    const defaults: { dbCol: string; opt: any; current: string | null }[] = [];
 
     for (const [, opt] of Object.entries(schema.columns)) {
       const dbCol = opt.name as string;
@@ -574,6 +713,8 @@ export class SchemaBuilder {
         if (deferNotNull) tighten.push({ dbCol, opt });
         continue;
       }
+
+      defaults.push({ dbCol, opt, current: existingCols[dbCol].default ?? null });
 
       /* A primary key is not null by definition, and saying so again is an
          error on some engines. */
@@ -602,6 +743,11 @@ export class SchemaBuilder {
       }
     }
 
+    /* Still the loosening phase: a default refuses no row. Done before the
+       effects so they, and the fill below, see the default the entity now
+       declares rather than the one the table had. */
+    await this.reconcileDefaults(entityName, defaults);
+
     await runEffects();
 
     for (const { dbCol, opt } of tighten) {
@@ -609,16 +755,34 @@ export class SchemaBuilder {
          reads "column contains null values" and stops the boot — the error
          sniprender met when `projects.code` became required over rows that
          predated it. */
-      const nulls = await this.connection.query(
+      const countNulls = async () => Number((await this.connection.query(
         `SELECT count(*) AS n FROM ${table} WHERE ${this.dialect.quote(dbCol)} IS NULL`,
-      );
-      const n = Number(nulls.rows[0]?.n ?? 0);
+      )).rows[0]?.n ?? 0);
+
+      let n = await countNulls();
+
+      /* A declared default fills them, the way ADD COLUMN fills existing rows
+         with one: the entity said what an absent value is, and a NULL row is
+         a row with an absent value. */
+      if (n > 0 && opt.default) {
+        currentLogger().warn(
+          `[DB] Filling ${n} NULL row${n === 1 ? "" : "s"} of ${entityName}.${dbCol} from its ` +
+            `default before applying NOT NULL.`,
+        );
+        await this.fillFromDefault(entityName, dbCol, Boolean(opt.unique));
+        n = await countNulls();
+      }
+
       if (n > 0) {
         throw new Error(
           `[DB] ${entityName}.${dbCol} is declared notNull, but ${n} existing ` +
-            `row${n === 1 ? "" : "s"} hold${n === 1 ? "s" : ""} NULL. Fill them from an effect on the ` +
-            `entity — \`static effects\` with when: "sync" or "once" — which runs after the column ` +
-            `exists and before this constraint is applied. Or give the column a DEFAULT.`,
+            `row${n === 1 ? "" : "s"} hold${n === 1 ? "s" : ""} NULL` +
+            (opt.default
+              ? ` even after filling from its default, which evaluates to NULL for them.`
+              : `. Declare a default on the column — sync fills NULL rows from it before applying ` +
+                `NOT NULL — or fill them from an effect on the entity: \`static effects\` with ` +
+                `when: "sync" or "once", which runs after the column exists and before this ` +
+                `constraint is applied.`),
         );
       }
       await this.connection.query(
@@ -886,6 +1050,8 @@ export class SchemaBuilder {
 
     /* Last, so a sync that threw part way leaves the previous shape in place
        and the next run sees the same difference rather than a half-applied one. */
+    this.warnHookBypass(entityName, schema, EntityClass);
+
     await this.saveSnapshot(entityName, schema);
   }
 

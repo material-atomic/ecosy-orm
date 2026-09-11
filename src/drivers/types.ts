@@ -19,6 +19,14 @@ export interface DriverConnection extends Queryable {
 export interface ColumnInfo {
   name: string;
   nullable: boolean;
+  /**
+   * The column's default as the engine renders it, or null for none.
+   *
+   * Rendered, not as written: Postgres stores `'html'` as `'html'::text` and
+   * `left(gen_random_uuid()::text, 8)` as `"left"((gen_random_uuid())::text, 8)`.
+   * Comparing it to a declaration takes {@link Dialect.renderDefaults}.
+   */
+  default?: string | null;
   /** The engine's own name for the type, for deciding whether it has to change. */
   type: string;
   /**
@@ -96,6 +104,23 @@ export interface Dialect {
 
   /** `SET NOT NULL` versus `MODIFY COLUMN`. */
   alterNullable(table: string, column: string, type: string, notNull: boolean): string;
+
+  /** `SET DEFAULT expression`, or `DROP DEFAULT` for null. Absent: defaults of existing columns are left alone. */
+  alterDefault?(table: string, column: string, expression: string | null): string;
+
+  /**
+   * How the engine would render each declared default, in the same order.
+   *
+   * The only exact answer to "is this the default the entity declares" is to
+   * let the engine rewrite the declaration the way it rewrote the stored one,
+   * and compare rendering to rendering. Recording the declaration beside the
+   * object — what checks do, in a COMMENT — works for a constraint, which the
+   * ORM owns; a column comment belongs to whoever documents the column.
+   *
+   * Called on a connection held in a transaction, so an implementation may use
+   * a temporary table dropped at commit.
+   */
+  renderDefaults?(db: Queryable, defaults: { type: string; expression: string }[]): Promise<string[]>;
 
   tableExists(db: Queryable, table: string): Promise<boolean>;
   listColumns(db: Queryable, table: string): Promise<ColumnInfo[]>;
