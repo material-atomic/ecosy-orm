@@ -256,6 +256,32 @@ export interface SyncOptions {
    * sync, and a project that never renames a column gets nothing for it.
    */
   snapshot?: boolean | undefined;
+
+  /**
+   * Whether sync may remove what the entity no longer declares.
+   *
+   * `"additive"` (the default from 2.0) never removes: a column, index, check,
+   * foreign key, unique constraint or default the entity stopped declaring is
+   * kept, and named in one warning per entity. A kept column that is NOT NULL
+   * is made nullable — loosening, not removing — so inserts that no longer
+   * mention it keep working. Changes the entity does declare still apply: new
+   * columns and constraints, retypes, a check or foreign key that changed, a
+   * unique moving between `true` and `"live"`.
+   *
+   * `"mirror"` is the old behaviour: the table becomes exactly what the entity
+   * says, and whatever it no longer says is dropped — a column with its data.
+   * Right for development; in production, removals belong in a migration
+   * someone reviewed.
+   */
+  mode?: "additive" | "mirror" | undefined;
+
+  /**
+   * Plan only. Reads run; nothing is written. Every statement sync would send
+   * is logged and collected on `SchemaBuilder.planned`. Effects are not run
+   * and data is not filled, so steps that depend on them are listed, not
+   * checked against the rows.
+   */
+  dryRun?: boolean | undefined;
 }
 
 export interface Driver extends Queryable {

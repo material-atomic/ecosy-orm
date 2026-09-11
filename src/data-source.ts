@@ -73,6 +73,8 @@ export class DataSource {
     const conn = new DataSource();
     const schemaBuilder = new SchemaBuilder(conn);
 
+    const dryRun = Boolean(this.current.sync?.dryRun);
+
     for (const EntityClass of this._entities) {
       if (EntityClass.entityName && EntityClass.schema) {
         try {
@@ -82,6 +84,13 @@ export class DataSource {
           throw error;
         }
       }
+    }
+
+    if (dryRun) {
+      currentLogger().warn(
+        `[DB] Dry run: ${schemaBuilder.planned.length} statement${schemaBuilder.planned.length === 1 ? "" : "s"} ` +
+          `planned across ${this._entities.length} entit${this._entities.length === 1 ? "y" : "ies"}, nothing changed.`,
+      );
     }
 
     return conn;

@@ -2,7 +2,8 @@ import { orm, connect, section, eq, rejects, logs, said, done } from "./_harness
 const { DataSource, Entity, createRepository, SchemaBuilder } = orm;
 void SchemaBuilder; void said;
 
-const db = await connect();
+/* Tests removal too, which only "mirror" does. */
+const db = await connect({ mode: "mirror" });
 const one = async (sql, p = []) => (await db.query(sql, p)).rows[0];
 void one;
 const nullable = async (t, c) => (await db.query(

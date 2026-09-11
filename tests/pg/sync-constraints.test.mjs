@@ -4,7 +4,8 @@
 import { orm, connect, section, eq, logs, said, done } from "./_harness.mjs";
 const { Entity, SchemaBuilder } = orm;
 
-const db = await connect();
+/* Tests removal too, which only "mirror" does. */
+const db = await connect({ mode: "mirror" });
 const sb = new SchemaBuilder(db);
 
 section("foreign keys");

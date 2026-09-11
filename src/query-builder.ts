@@ -473,7 +473,38 @@ export class SchemaBuilder {
      * driver to read it from.
      */
     private sync: SyncOptions = safeSyncOptions(),
-  ) {}
+  ) {
+    if (this.sync.dryRun) {
+      const real = this.connection;
+      const planned = this.planned;
+      /* Reads go through, so the plan is made against the database as it is;
+         anything else is recorded and answered with nothing. */
+      this.connection = {
+        query: async (sql: string, params?: unknown[]) => {
+          if (/^\s*(SELECT|WITH)\b/i.test(sql)) return real.query(sql, params);
+          planned.push(sql.replace(/\s+/g, " ").trim());
+          currentLogger().info(`[DB] plan: ${planned[planned.length - 1]}`);
+          return { rows: [], rowCount: 0 };
+        },
+      };
+    }
+  }
+
+  /** With `dryRun`: every statement sync would have sent, in order. */
+  readonly planned: string[] = [];
+
+  /** What sync kept, per entity, because the mode does not let it remove. */
+  private leftovers = new Map<string, string[]>();
+
+  private get removes(): boolean {
+    return this.sync.mode === "mirror";
+  }
+
+  private keep(entityName: string, what: string) {
+    const list = this.leftovers.get(entityName) ?? [];
+    list.push(what);
+    this.leftovers.set(entityName, list);
+  }
 
   private columnDefinition(opt: any, withPrimaryKey: boolean, withNotNull = true) {
     let def = `${this.dialect.quote(opt.name)} ${opt.type}`;
@@ -544,6 +575,7 @@ export class SchemaBuilder {
    * index", once, for the first pair it trips on.
    */
   private async assertUnique(entityName: string, schema: SchemaOptions, keys: readonly string[], live: boolean) {
+    if (this.sync.dryRun) return;
     const cols = keys.map((k) => this.dialect.quote(String(schema.columns[k]?.name ?? k)));
     const filters = cols.map((c) => `${c} IS NOT NULL`);
     if (live) filters.push(this.livePredicate(schema));
@@ -595,10 +627,17 @@ export class SchemaBuilder {
        )`,
     );
 
-    const result = await this.connection.query(
-      `SELECT shape FROM ${this.dialect.quote(SchemaBuilder.SNAPSHOT_TABLE)} WHERE entity = $1`,
-      [entityName],
-    );
+    let result;
+    try {
+      result = await this.connection.query(
+        `SELECT shape FROM ${this.dialect.quote(SchemaBuilder.SNAPSHOT_TABLE)} WHERE entity = $1`,
+        [entityName],
+      );
+    } catch (error: any) {
+      /* A plan recorded the CREATE TABLE rather than running it. */
+      if (this.sync.dryRun && error?.code === "42P01") return null;
+      throw error;
+    }
 
     if (!result.rows.length) return null;
 
@@ -689,6 +728,10 @@ export class SchemaBuilder {
 
       if (declared === null) {
         if (current === null || /^nextval\(/i.test(current)) continue;
+        if (!this.removes) {
+          this.keep(entityName, `default of ${dbCol}`);
+          continue;
+        }
         currentLogger().warn(`[DB] Dropping the default of ${entityName}.${dbCol} — the entity no longer declares one.`);
         await this.connection.query(this.dialect.alterDefault(entityName, dbCol, null));
         continue;
@@ -902,6 +945,7 @@ export class SchemaBuilder {
    * writes to it. It says that now, with the count.
    */
   private async explainUnvalidated(entityName: string, chk: { name: string; expression: string }) {
+    if (this.sync.dryRun) return;
     const bad = await this.connection.query(
       `SELECT count(*) AS n FROM ${this.dialect.quote(entityName)} WHERE NOT (${chk.expression})`,
     );
@@ -973,7 +1017,12 @@ export class SchemaBuilder {
   private async syncUnlocked(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {
     const table = this.dialect.quote(entityName);
     const runEffects = async () => {
-      if (!(EntityClass as { effects?: unknown[] } | undefined)?.effects?.length) return;
+      const declared = (EntityClass as { effects?: { name: string }[] } | undefined)?.effects;
+      if (!declared?.length) return;
+      if (this.sync.dryRun) {
+        this.planned.push(`-- effects of ${entityName} would run here: ${declared.map((e) => e.name).join(", ")}`);
+        return;
+      }
       /* Imported here, not at the top: effects need a repository, a
          repository needs this module, and a cycle in a package whose root
          re-exports both is a class that is undefined when the other loads. */
@@ -1098,6 +1147,13 @@ export class SchemaBuilder {
         `SELECT count(*) AS n FROM ${table} WHERE ${this.dialect.quote(dbCol)} IS NULL`,
       )).rows[0]?.n ?? 0);
 
+      /* In a plan the column may not exist yet — its ADD was recorded, not
+         run — and the effects that would fill it did not run either. */
+      if (this.sync.dryRun) {
+        await this.connection.query(this.dialect.alterNullable(entityName, dbCol, opt.type as string, true));
+        continue;
+      }
+
       let n = await countNulls();
 
       /* A declared default fills them, the way ADD COLUMN fills existing rows
@@ -1142,6 +1198,17 @@ export class SchemaBuilder {
 
     for (const name of Object.keys(existingCols)) {
       if (declared.has(name)) continue;
+
+      if (!this.removes) {
+        this.keep(entityName, `column ${name}`);
+        /* Kept, but no longer allowed to refuse a row: inserts written against
+           the entity do not mention it, and NOT NULL without a default would
+           fail every one of them. */
+        if (!existingCols[name]!.nullable) {
+          await this.connection.query(this.dialect.alterNullable(entityName, name, existingCols[name]!.type, false));
+        }
+        continue;
+      }
 
       /* One column gone and another arrived in the same sync is what a rename
          looks like from here. Telling them apart needs the snapshot, which is
@@ -1208,6 +1275,11 @@ export class SchemaBuilder {
 
       if (same) continue;
 
+      if (current && !wanted && !this.removes) {
+        this.keep(entityName, `foreign key ${current.name}`);
+        continue;
+      }
+
       if (current) {
         currentLogger().warn(
           `[DB] Dropping foreign key ${current.name} on ${entityName}.${column} — ` +
@@ -1263,6 +1335,8 @@ export class SchemaBuilder {
           await this.assertUnique(entityName, schema, [key], false);
           currentLogger().info(`[DB] Adding a unique constraint on ${entityName}.${dbCol}.`);
           await this.connection.query(this.dialect.addUnique(entityName, `${entityName}_${dbCol}_key`, dbCol));
+        } else if (opt.unique !== true && existing && opt.unique !== "live" && !this.removes) {
+          this.keep(entityName, `unique constraint ${existing}`);
         } else if (opt.unique !== true && existing) {
           currentLogger().warn(
             `[DB] Dropping the unique constraint on ${entityName}.${dbCol} — the entity ` +
@@ -1313,6 +1387,13 @@ export class SchemaBuilder {
 
     for (const name of await this.dialect.listOwnedIndexes(this.connection, entityName)) {
       if (declaredIndexes.has(name)) continue;
+      /* A `_live_key` index is sync's own rendering of `unique: "live"`; when
+         the column stops being live-unique it is being replaced, not left
+         behind, and goes whatever the mode. */
+      if (!this.removes && !name.endsWith("_live_key")) {
+        this.keep(entityName, `index ${name}`);
+        continue;
+      }
 
       currentLogger().warn(`[DB] Dropping index ${name} on ${entityName} — no longer declared.`);
       await this.connection.query(`DROP INDEX ${this.dialect.quote(name)}`);
@@ -1429,6 +1510,12 @@ export class SchemaBuilder {
 
     for (const name of Object.keys(existingChecks)) {
       if (declaredChecks.has(name)) continue;
+      /* `_ecosy_wide` is sync's own stand-in from the loosen phase; it goes
+         whatever the mode. */
+      if (!this.removes && !name.endsWith("_ecosy_wide")) {
+        this.keep(entityName, `check ${name}`);
+        continue;
+      }
 
       if (!name.endsWith("_ecosy_wide")) {
         currentLogger().warn(`[DB] Dropping check ${name} on ${entityName} — no longer declared.`);
@@ -1441,6 +1528,16 @@ export class SchemaBuilder {
     /* Last, so a sync that threw part way leaves the previous shape in place
        and the next run sees the same difference rather than a half-applied one. */
     this.warnHookBypass(entityName, schema, EntityClass);
+
+    const kept = this.leftovers.get(entityName);
+    if (kept?.length) {
+      this.leftovers.delete(entityName);
+      currentLogger().warn(
+        `[DB] ${entityName}: kept ${kept.length} thing${kept.length === 1 ? "" : "s"} the entity no longer ` +
+          `declares — ${kept.join(", ")}. Sync is additive and removes nothing. Drop ${kept.length === 1 ? "it" : "them"} ` +
+          `with a migration, or set sync: { mode: "mirror" } on the driver to let sync remove what the entity does not say.`,
+      );
+    }
 
     await this.saveSnapshot(entityName, schema);
   }

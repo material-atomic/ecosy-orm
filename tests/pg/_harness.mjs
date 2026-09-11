@@ -41,14 +41,18 @@ export function fixture(name, { allowEmpty = false } = {}) {
 export const logs = [];
 const capture = (...parts) => logs.push(parts.map(String).join(" "));
 
-export async function connect() {
+/**
+ * @param sync Driver sync options. Files that test removal pass
+ * `{ mode: "mirror" }`; the rest run on the package default, additive.
+ */
+export async function connect(sync = undefined) {
   const url = process.env.TEST_DATABASE_URL;
   if (!url) {
     console.error("Run through tests/pg/run.mjs, which sets TEST_DATABASE_URL to the test database.");
     process.exit(2);
   }
   orm.DataSource.logger({ debug() {}, info: capture, warn: capture, error: capture });
-  await orm.DataSource.initialize(PgDriver({ connectionString: url }));
+  await orm.DataSource.initialize(PgDriver({ connectionString: url, ...(sync ? { sync } : {}) }));
   return new orm.DataSource();
 }
 
