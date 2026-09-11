@@ -78,6 +78,22 @@ section("one deploy: rename AND narrow the check, new value not allowed by the o
   await rejects("and it enforces the new list", () => db.query(`INSERT INTO vr_two (type) VALUES ('web')`), /violates check constraint/);
 }
 
+section("three processes boot on the same check change at once");
+{
+  await db.query(`CREATE TABLE vr_race (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), type text NOT NULL, size integer NOT NULL DEFAULT 0)`);
+  const Old = Entity.create("vr_race", { columns: cols, checks: [{ ...check(["web", "react"]), name: "vr_race_known" }] });
+  await createRepository(Old).syncSchema();
+  await db.query(`INSERT INTO vr_race (type) VALUES ('web'), ('react')`);
+  class Next extends Entity.create("vr_race", { columns: cols, checks: [{ ...check(["html", "react"]), name: "vr_race_known" }] }) {
+    static effects = [{ name: "web", when: "sync", run: ({ tx }) => tx.query(`UPDATE vr_race SET type = 'html' WHERE type = 'web'`) }];
+  }
+  const results = await Promise.allSettled([1, 2, 3].map(() => new orm.SchemaBuilder(db).syncSchema("vr_race", Next.schema, Next)));
+  eq("none of them fails", results.filter((r) => r.status === "rejected").map((r) => r.reason?.message?.slice(0, 120)), []);
+  eq("one check, the new one, validated", (await db.query(
+    `SELECT conname, convalidated FROM pg_constraint WHERE conrelid = 'vr_race'::regclass AND contype = 'c'`,
+  )).rows, [{ conname: "vr_race_known", convalidated: true }]);
+}
+
 section("the effect fails: the table keeps a check, never none");
 {
   await db.query(`CREATE TABLE vr_three (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), type text NOT NULL, size integer NOT NULL DEFAULT 0)`);

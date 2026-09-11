@@ -139,6 +139,23 @@ eq("stamps are whole milliseconds — they survive a trip through a JS Date",
 await projects.restore({ id: p.id });
 eq("restoring P brings back B and C, not A", names(await files.find({})), ["B", "C"]);
 
+section("a stamp read into JavaScript and passed back matches itself");
+{
+  await notes.insert({ name: "rt" });
+  await notes.delete({ name: "rt" });
+  const [row] = await notes.find({ where: { name: "rt" }, onlyDeleted: true });
+  eq("deletedAt reads back as a Date", row.deletedAt instanceof Date, true);
+  eq("restore({ deletedAt: <that Date> }) finds the row", (await notes.restore({ name: "rt", deletedAt: row.deletedAt })).rowCount, 1);
+
+  /* The control: the same trip with a microsecond stamp — what now() gives
+     untruncated — does not match. This is the bug the truncation prevents. */
+  await notes.delete({ name: "rt" });
+  await db.query(`UPDATE sd_note SET deleted_at = '2026-09-11 10:00:00.123456+00' WHERE name = 'rt'`);
+  const [micro] = await notes.find({ where: { name: "rt" }, onlyDeleted: true });
+  eq("control: a microsecond stamp does not survive the trip", (await notes.restore({ name: "rt", deletedAt: micro.deletedAt })).rowCount, 0);
+  await notes.delete({ name: "rt" }, { hard: true, onlyDeleted: true });
+}
+
 /* ───────── sniprender 3: live-only unique at index level ───────── */
 section('unique: "live" on an index — (project_id, path)');
 await files.delete({ name: "C" });
@@ -161,6 +178,16 @@ await codes.insert({ name: "old", email: "abcd1234" });
 await codes.delete({ name: "old" });
 await rejects("true: a deleted row's value is not given up (a shared link stays its owner's)",
   () => codes.insert({ name: "new", email: "abcd1234" }), /duplicate key|unique/i);
+
+section("upsert against a soft-deleted row: refused, never revived");
+await codes.insert({ name: "live-one", email: "live0001" });
+await rejects("upsert colliding with a deleted row throws, with the way out",
+  () => codes.upsert([{ name: "revived?", email: "abcd1234" }, { name: "fresh", email: "fresh001" }], ["email"]),
+  /collide on \(email\) with soft-deleted rows.*does not revive.*restore\(\) it and then update\(\).*Nothing was written/s);
+eq("…the deleted row stayed deleted and untouched", (await db.query(`SELECT name, deleted_at IS NOT NULL AS gone FROM sd_code WHERE email = 'abcd1234'`)).rows, [{ name: "old", gone: true }]);
+eq("…and the rest of the batch was rolled back", (await db.query(`SELECT count(*)::int n FROM sd_code WHERE email = 'fresh001'`)).rows[0].n, 0);
+const liveUp = await codes.upsert({ name: "live-one-b", email: "live0001" }, ["email"]);
+eq("upsert against a live row still updates it", liveUp.name, "live-one-b");
 
 const liveUser = Entity.create("sd_user", { columns: userCols("live"), softDelete: "deletedAt" });
 const users = createRepository(liveUser);

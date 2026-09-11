@@ -33,6 +33,11 @@ const files = readdirSync(dir)
   .filter((f) => !only.length || only.some((o) => f.includes(o)))
   .sort();
 
+if (!files.length) {
+  console.error(`No test files matched${only.length ? ` ${only.join(", ")}` : ""}. Nothing ran, which is not a pass.`);
+  process.exit(1);
+}
+
 const results = [];
 for (const file of files) {
   /* A clean schema per file, so no file depends on what another left. */

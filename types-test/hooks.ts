@@ -24,7 +24,7 @@ export class ProjectEntity extends Entity.create("projects", configs) {
   }
 
   async beforeUpdate() {
-    this.updatedAt = new Date().toISOString();
+    this.updatedAt = new Date();
   }
 
   afterLoad() {

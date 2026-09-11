@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import type { PartialInput } from "./optional";
+import type { PartialInput, Writable, WriteInput } from "./optional";
 import type { Entity as BaseEntity, EntityConstructor, HookContext } from "./entity";
 import { DataSource } from "./data-source";
 import { Transaction } from "./transaction";
@@ -34,7 +34,7 @@ export type FindCondition<T> =
   | ReturnType<typeof Between<T>>;
 
 export type ObjectWhere<Entity extends BaseEntity> = {
-  [K in keyof Entity]?: FindCondition<Entity[K]>;
+  [K in keyof Entity]?: FindCondition<Writable<Entity[K]>>;
 };
 
 export interface AndCondition<Entity extends BaseEntity> {
@@ -325,10 +325,10 @@ export abstract class Repository<Entity extends BaseEntity> {
    * columns; nothing a hook adds that is not a column reaches the SQL.
    */
   protected async prepare(
-    rows: PartialInput<Entity>[],
+    rows: WriteInput<Entity>[],
     hook: "beforeInsert" | "beforeUpdate",
   ): Promise<PartialInput<Entity>[]> {
-    if (!this.has(hook)) return rows;
+    if (!this.has(hook)) return rows as PartialInput<Entity>[];
 
     const prepared: PartialInput<Entity>[] = [];
     for (const row of rows) {
@@ -381,9 +381,9 @@ export abstract class Repository<Entity extends BaseEntity> {
     return result.rows.length ? this.hydrateRows(result.rows)[0] : null;
   }
 
-  async insert(data: PartialInput<Entity>): Promise<Entity>;
-  async insert(data: PartialInput<Entity>[]): Promise<Entity[]>;
-  async insert(data: PartialInput<Entity> | PartialInput<Entity>[]): Promise<Entity | Entity[] | null> {
+  async insert(data: WriteInput<Entity>): Promise<Entity>;
+  async insert(data: WriteInput<Entity>[]): Promise<Entity[]>;
+  async insert(data: WriteInput<Entity> | WriteInput<Entity>[]): Promise<Entity | Entity[] | null> {
     const isArray = Array.isArray(data);
     const input = isArray ? data : [data];
     if (!input.length) return isArray ? [] : null;
@@ -417,7 +417,7 @@ export abstract class Repository<Entity extends BaseEntity> {
    */
   async update(
     where: FindWhereOptions<Entity>,
-    data: PartialInput<Entity>,
+    data: WriteInput<Entity>,
     options: { returning?: boolean | undefined } & ScopeOptions = {},
   ): Promise<{ rows: Entity[]; rowCount: number }> {
     const returning = Boolean(options.returning) || this.has("afterUpdate");
@@ -576,21 +576,42 @@ export abstract class Repository<Entity extends BaseEntity> {
     return before || after ? this.atomically(run) : run(this);
   }
 
-  async upsert(data: PartialInput<Entity>, conflictColumns: string[]): Promise<Entity>;
-  async upsert(data: PartialInput<Entity>[], conflictColumns: string[]): Promise<Entity[]>;
-  async upsert(data: PartialInput<Entity> | PartialInput<Entity>[], conflictColumns: string[]): Promise<Entity | Entity[] | null> {
+  async upsert(data: WriteInput<Entity>, conflictColumns: string[]): Promise<Entity>;
+  async upsert(data: WriteInput<Entity>[], conflictColumns: string[]): Promise<Entity[]>;
+  async upsert(data: WriteInput<Entity> | WriteInput<Entity>[], conflictColumns: string[]): Promise<Entity | Entity[] | null> {
     const isArray = Array.isArray(data);
     const input = isArray ? data : [data];
     if (!input.length) return isArray ? [] : null;
 
     const run = async (repo: this) => {
       const arr = await repo.prepare(input, "beforeInsert");
-      const { sql, params } = repo.queryBuilder.buildUpsert(arr, conflictColumns);
+      const { sql, params, skipsDeleted } = repo.queryBuilder.buildUpsert(arr, conflictColumns);
       const result = await repo.connection.query(sql, params);
-      return repo.hydrateRows(result.rows);
+      const rows = repo.hydrateRows(result.rows);
+
+      if (skipsDeleted && rows.length < arr.length) {
+        /* Every input row either inserts or updates a live row, and both come
+           back. One that did not came up against a soft-deleted row. */
+        const key = (row: any) => JSON.stringify(conflictColumns.map((c) => String(row[c])));
+        const returned = new Set(rows.map(key));
+        const blocked = arr.filter((row) => !returned.has(key(row)));
+        throw new Error(
+          `[Repository] upsert() on ${repo.entityName}: ${blocked.length} row${blocked.length === 1 ? "" : "s"} ` +
+            `collide on (${conflictColumns.join(", ")}) with soft-deleted rows — for example ` +
+            `${blocked.slice(0, 3).map(key).join(", ")}. upsert() does not revive a deleted row: every ` +
+            `column the payload leaves out would come back with the deleted row's data. restore() it ` +
+            `and then update(), or remove it with delete(…, { hard: true, onlyDeleted: true }). ` +
+            `Nothing was written.`,
+        );
+      }
+      return rows;
     };
 
-    const rows = this.has("beforeInsert") ? await this.atomically(run) : await run(this);
+    /* On a soft-deleting entity the refusal above has to undo the rest of the
+       batch, so it runs in a transaction whether or not there are hooks. */
+    const rows = this.has("beforeInsert") || this.schema.softDelete
+      ? await this.atomically(run)
+      : await run(this);
     return isArray ? rows : (rows[0] ?? null);
   }
 }

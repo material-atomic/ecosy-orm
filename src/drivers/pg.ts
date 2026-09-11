@@ -29,7 +29,7 @@ const dialect: Dialect = {
 
   softDeleteStamp: "date_trunc('milliseconds', now())",
 
-  upsertClause: (conflictColumns, updateColumns, predicate) => {
+  upsertClause: (conflictColumns, updateColumns, predicate, updateWhere) => {
     const target = conflictColumns.map((c) => dialect.quote(c)).join(", ");
 
     /* Every inserted column is a conflict column, so there is nothing left to
@@ -47,7 +47,8 @@ const dialect: Dialect = {
       ? updateColumns.map((c) => `${dialect.quote(c)} = EXCLUDED.${dialect.quote(c)}`).join(", ")
       : `${dialect.quote(conflictColumns[0]!)} = EXCLUDED.${dialect.quote(conflictColumns[0]!)}`;
 
-    return `ON CONFLICT (${target})${predicate ? ` WHERE ${predicate}` : ""} DO UPDATE SET ${assignments}`;
+    return `ON CONFLICT (${target})${predicate ? ` WHERE ${predicate}` : ""} DO UPDATE SET ${assignments}` +
+      (updateWhere ? ` WHERE ${updateWhere}` : "");
   },
 
   alterNullable: (table, column, _type, notNull) =>

@@ -7,6 +7,7 @@ import type { ColumnInfo, Dialect, Queryable, SyncOptions } from "./drivers/type
 import { currentDialect, currentDriver } from "./drivers/current";
 import { DataSource } from "./data-source";
 import { Transaction } from "./transaction";
+import { withLock } from "./lock";
 
 
 /** Which rows an operation reaches on a soft-deleting entity. */
@@ -368,8 +369,12 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return { sql, params };
   }
 
-  buildUpsert(arr: PartialInput<Entity>[], conflictColumns: string[]): { sql: string, params: any[] } {
-    if (!arr.length) return { sql: "", params: [] };
+  /**
+   * `skipsDeleted` is true when a conflict with a soft-deleted row leaves that
+   * row alone rather than updating it — see `Repository.upsert`.
+   */
+  buildUpsert(arr: PartialInput<Entity>[], conflictColumns: string[]): { sql: string, params: any[], skipsDeleted: boolean } {
+    if (!arr.length) return { sql: "", params: [], skipsDeleted: false };
     const tsKeys = this.givenKeys(arr);
 
     /* An insert can fill a gap with DEFAULT; an upsert cannot. On conflict the
@@ -426,9 +431,18 @@ export class QueryBuilder<Entity extends BaseEntity> {
       ? `${this.q(this.dbCol(this.schema.softDelete!))} IS NULL`
       : undefined;
 
-    const sql = `${insertSql} ${this.dialect.upsertClause(dbConflictColumns, updateColumns, predicate)}${this.returning()}`;
+    /* A full unique counts soft-deleted rows, so the conflict can land on one.
+       Updating it would revive it without restore(), carrying every column the
+       payload did not mention back from the deleted row. The update is fenced
+       to live rows instead; a dead row that conflicts is left alone and
+       returns nothing, and the repository refuses the batch. */
+    const soft = this.schema.softDelete;
+    const skipsDeleted = Boolean(soft) && !live;
+    const updateWhere = skipsDeleted ? `${this.withEntity(soft!)} IS NULL` : undefined;
+
+    const sql = `${insertSql} ${this.dialect.upsertClause(dbConflictColumns, updateColumns, predicate, updateWhere)}${this.returning()}`;
     
-    return { sql, params };
+    return { sql, params, skipsDeleted };
   }
 }
 
@@ -740,6 +754,19 @@ export class SchemaBuilder {
         await this.connection.query(sql);
         return;
       } catch (error: any) {
+        /* 23514: filling one column rewrites the whole row, and the row is
+           checked whole — so a check left NOT VALID over the very rows being
+           filled refuses the fill for a column it never mentions. sniprender
+           has exactly that: projects_type_known NOT VALID over 'web' rows. */
+        if (error?.code === "23514") {
+          throw new Error(
+            `[DB] Filling ${entityName}.${dbCol} from its default was refused by check ` +
+              `"${error.constraint ?? "?"}": rows that need filling break it — it was left NOT VALID ` +
+              `over them. Fix those rows first, from an effect on the entity: effects run before ` +
+              `this fill.`,
+            { cause: error },
+          );
+        }
         if (error?.code !== "23505" || attempt >= attempts) {
           if (error?.code === "23505") {
             throw new Error(
@@ -824,15 +851,22 @@ export class SchemaBuilder {
 
       const wide = `${chk.name}_ecosy_wide`;
       currentLogger().info(`[DB] Check ${chk.name} on ${entityName} changed — admitting old and new values while effects run.`);
-      if (existing[wide]) await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(wide)}`);
+      /* Not under a lock: two processes booting on the same change both get
+         here. Every step therefore tolerates the other having done it first —
+         IF EXISTS on the drops, 42710 (already exists) on the add. */
+      if (existing[wide]) await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${this.dialect.quote(wide)}`);
       /* NOT VALID: the stand-in lives for the length of one sync, and the rows
          already satisfy the old half — there is nothing to scan for. */
-      await this.connection.query(this.checkStatement(
-        entityName,
-        { name: wide, expression: `(${current.declared}) OR (${chk.expression})` },
-        false,
-      ));
-      await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(chk.name)}`);
+      try {
+        await this.connection.query(this.checkStatement(
+          entityName,
+          { name: wide, expression: `(${current.declared}) OR (${chk.expression})` },
+          false,
+        ));
+      } catch (error: any) {
+        if (error?.code !== "42710") throw error;
+      }
+      await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${this.dialect.quote(chk.name)}`);
     }
   }
 
@@ -841,6 +875,8 @@ export class SchemaBuilder {
     try {
       await this.connection.query(this.checkStatement(entityName, chk));
     } catch (error: any) {
+      /* Another process booting alongside added it between our read and now. */
+      if (error?.code === "42710") return;
       if (error?.code !== "23514" || !this.dialect.supportsUnvalidatedCheck) throw error;
       await this.connection.query(this.checkStatement(entityName, chk, false));
       await this.explainUnvalidated(entityName, chk);
@@ -892,6 +928,15 @@ export class SchemaBuilder {
    * @param EntityClass The entity, when there is one, for its `effects`.
    */
   async syncSchema(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {
+    /* One process at a time per table. Several replicas booting together
+       otherwise interleave statement by statement — one drops what another is
+       about to drop, or reads a constraint between the ADD and the COMMENT that
+       records its declaration, and takes the half-made state for an old one.
+       Each such gap can be patched on its own; the lock closes all of them. */
+    return withLock(`ecosy:orm:sync:${entityName}`, () => this.syncUnlocked(entityName, schema, EntityClass));
+  }
+
+  private async syncUnlocked(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {
     const table = this.dialect.quote(entityName);
     const runEffects = async () => {
       if (!(EntityClass as { effects?: unknown[] } | undefined)?.effects?.length) return;
@@ -1256,7 +1301,7 @@ export class SchemaBuilder {
         /* A widened stand-in from the loosen phase has done its job. */
         const wide = `${chk.name}_ecosy_wide`;
         if (existingChecks[wide]) {
-          await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(wide)}`);
+          await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${this.dialect.quote(wide)}`);
           delete existingChecks[wide];
         }
         continue;
@@ -1351,9 +1396,11 @@ export class SchemaBuilder {
     for (const name of Object.keys(existingChecks)) {
       if (declaredChecks.has(name)) continue;
 
-      currentLogger().warn(`[DB] Dropping check ${name} on ${entityName} — no longer declared.`);
+      if (!name.endsWith("_ecosy_wide")) {
+        currentLogger().warn(`[DB] Dropping check ${name} on ${entityName} — no longer declared.`);
+      }
       await this.connection.query(
-        `ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(name)}`,
+        `ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${this.dialect.quote(name)}`,
       );
     }
 

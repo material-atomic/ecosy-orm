@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import type { PartialInput } from "./optional";
+import type { PartialInput, WriteInput } from "./optional";
 import type { Repository, FindWhereOptions, ColumnOptions, IndexOptions, CheckOptions } from "./repository";
 import type { EntityEffect } from "./effects";
 import type { Queryable } from "./drivers/types";
@@ -41,7 +41,11 @@ export type InferColumnType<T extends string> =
   T extends "TEXT" | "UUID" ? string :
   T extends "INTEGER" | "BIGINT" | "FLOAT" | "SERIAL" ? number :
   T extends "BOOLEAN" ? boolean :
-  T extends "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" ? string :
+  /* A Date, because that is what the driver returns — `pg` parses timestamp,
+     timestamptz and date into one. This said `string` until 1.2.0, which sent
+     code comparing and serialising these as text, and made a microsecond stamp
+     look like it would round-trip. Writes still accept a string: see Writable. */
+  T extends "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" ? Date :
   unknown;
 
 export type InferSchema<TCols extends Record<string, ColumnOptions>> = {
@@ -148,7 +152,7 @@ export abstract class Entity {
    *
    * @example
    * beforeUpdate() {
-   *   this.updatedAt = new Date().toISOString();
+   *   this.updatedAt = new Date();
    * }
    */
   beforeUpdate?(context: HookContext): void | Promise<void>;
@@ -392,7 +396,10 @@ export abstract class Entity {
          to the database and missing from here. */
       const { rows } = await repo.update(
         { [pkField]: pkValue } as FindWhereOptions<this>,
-        updateData as PartialInput<this>,
+        /* A row read back holds Dates where the input type also takes strings;
+           the conditional `Writable` cannot be resolved against a generic
+           `this`, so the compiler is told what is already true. */
+        updateData as unknown as WriteInput<this>,
         /* Addressed by primary key to the one row this instance is, so there
            is nothing for the live-rows filter to protect. */
         { returning: true, withDeleted: Boolean(repo.schema.softDelete) || undefined },
@@ -400,7 +407,7 @@ export abstract class Entity {
       if (rows[0]) Object.assign(this, rows[0]);
       return this;
     } else {
-      const inserted = await repo.insert(this);
+      const inserted = await repo.insert(this as unknown as WriteInput<this>);
       Object.assign(this, inserted);
       return this;
     }

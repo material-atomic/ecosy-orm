@@ -100,8 +100,12 @@ export interface Dialect {
    * mapped to their database names.
    * @param updateColumns Columns to overwrite, already mapped.
    */
-  /** `predicate` names a partial unique index as the arbiter: `ON CONFLICT (cols) WHERE predicate`. */
-  upsertClause(conflictColumns: string[], updateColumns: string[], predicate?: string): string;
+  /**
+   * `predicate` names a partial unique index as the arbiter:
+   * `ON CONFLICT (cols) WHERE predicate`. `updateWhere` limits which
+   * conflicting rows are updated: `DO UPDATE SET … WHERE updateWhere`.
+   */
+  upsertClause(conflictColumns: string[], updateColumns: string[], predicate?: string, updateWhere?: string): string;
 
   /**
    * What a soft delete writes into the column. Default `CURRENT_TIMESTAMP`.

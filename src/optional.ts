@@ -41,3 +41,17 @@
  * step.
  */
 export type PartialInput<T> = { [K in keyof T]?: T[K] | undefined };
+
+/**
+ * What a column accepts on the way in, given what it reads back as.
+ *
+ * Timestamps and dates come out of `pg` as a `Date`, and are declared so. On
+ * the way in either is fine — the driver sends a Date as ISO text, and Postgres
+ * parses an ISO string the same way — and code written against the old
+ * `string` typing passes `toISOString()` everywhere. Accepting both keeps all
+ * of that compiling while the read side tells the truth.
+ */
+export type Writable<V> = V extends Date ? Date | string : V;
+
+/** {@link PartialInput}, with {@link Writable} per column. For insert, update and upsert. */
+export type WriteInput<T> = { [K in keyof T]?: Writable<T[K]> | undefined };

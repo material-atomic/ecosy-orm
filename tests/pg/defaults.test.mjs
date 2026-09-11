@@ -180,6 +180,34 @@ section("A probe on the builder's own transaction");
   eq("two probes in one transaction, no name clash", await colDefault("hk_lit", "kind"), "upper('x'::text)");
 }
 
+section("Filling from a default over rows a NOT VALID check refuses");
+{
+  /* sniprender's production, had it gone the default route: projects_type_known
+     NOT VALID over 'web' rows, and code about to be filled. Filling rewrites the
+     whole row, so the check refuses a fill of a column it never mentions. */
+  await db.query(`CREATE TABLE hk_nv (id serial PRIMARY KEY, type text NOT NULL, code text UNIQUE)`);
+  await db.query(`INSERT INTO hk_nv (type) VALUES ('web'), ('html')`);
+  await db.query(`ALTER TABLE hk_nv ADD CONSTRAINT hk_nv_type_known CHECK (type IN ('html')) NOT VALID`);
+  await db.query(`COMMENT ON CONSTRAINT hk_nv_type_known ON hk_nv IS 'type IN (''html'')'`);
+  const nvCols = {
+    id: { type: "SERIAL", primaryKey: true },
+    type: { type: "TEXT", notNull: true },
+    code: { type: "TEXT", notNull: true, unique: true, default: "left(gen_random_uuid()::text, 8)" },
+  };
+  const NV = Entity.create("hk_nv", { columns: nvCols, checks: [{ name: "hk_nv_type_known", expression: "type IN ('html')" }] });
+  await rejects("names the check and points at an effect, not a raw 23514",
+    () => createRepository(NV).syncSchema(), /refused by check "hk_nv_type_known".*NOT VALID.*from an effect on the entity: effects run before this fill/s);
+  class NVFixed extends Entity.create("hk_nv", { columns: nvCols, checks: [{ name: "hk_nv_type_known", expression: "type IN ('html')" }] }) {
+    static effects = [{ name: "web", when: "sync", run: ({ tx }) => tx.query(`UPDATE hk_nv SET type = 'html' WHERE type = 'web'`) }];
+  }
+  await createRepository(NVFixed).syncSchema();
+  eq("with the effect: rows fixed, filled, NOT NULL on, check validated", [
+    (await one(`SELECT count(*)::int n FROM hk_nv WHERE code IS NULL`)).n,
+    await nullable("hk_nv", "code"),
+    (await one(`SELECT convalidated v FROM pg_constraint WHERE conname = 'hk_nv_type_known'`)).v,
+  ], [0, "NO", true]);
+}
+
 section("Acknowledging a cascade silences its warning");
 {
   class Ack extends Entity.create("hk_child", { columns: {

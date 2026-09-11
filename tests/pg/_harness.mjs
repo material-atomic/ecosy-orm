@@ -4,12 +4,38 @@
  *
  * A file exits non-zero when any check fails; the runner counts exit codes.
  */
+import { readdirSync } from "node:fs";
+
 const dist = new URL("../../dist/", import.meta.url);
 
 export const orm = await import(new URL("index.mjs", dist).href);
 export const { PgDriver } = await import(new URL("drivers/pg.mjs", dist).href);
 export const loadMigration = () => import(new URL("migration.mjs", dist).href);
-export const fixtures = new URL("./fixtures/", import.meta.url).pathname;
+const fixturesDir = new URL("./fixtures/", import.meta.url).pathname;
+
+/**
+ * A fixture directory, refused if it is missing or empty.
+ *
+ * The rollback test once read its migrations from /tmp. /tmp was cleared, the
+ * directory vanished, and the test went on passing — zero files run, zero
+ * tracking rows written, "no trace left", check. A fixture that is not there
+ * has to be a failure, not a vacuous pass.
+ */
+export function fixture(name, { allowEmpty = false } = {}) {
+  const dir = `${fixturesDir}${name}`;
+  let entries;
+  try {
+    entries = readdirSync(dir).filter((f) => !f.startsWith("."));
+  } catch {
+    console.error(`  ✗ fixture ${name} is missing (${dir})`);
+    process.exit(1);
+  }
+  if (!allowEmpty && !entries.length) {
+    console.error(`  ✗ fixture ${name} is empty (${dir})`);
+    process.exit(1);
+  }
+  return dir;
+}
 
 /** Everything the package logged, for tests that assert on warnings. */
 export const logs = [];
@@ -54,5 +80,10 @@ export const said = (pattern) => logs.some((line) => pattern.test(line));
 export async function done() {
   await orm.DataSource.end();
   console.log(`\n${passed} passed, ${failed} failed`);
+  /* A file that checked nothing proves nothing, and must not read as green. */
+  if (passed + failed === 0) {
+    console.error("  ✗ this file ran no checks");
+    process.exit(1);
+  }
   process.exit(failed ? 1 : 0);
 }
