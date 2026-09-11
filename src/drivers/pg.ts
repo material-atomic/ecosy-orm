@@ -191,6 +191,9 @@ const dialect: Dialect = {
     return Object.fromEntries(result.rows.map((row: any) => [row.attname, row.conname]));
   },
 
+  validateCheck: (table, name) =>
+    `ALTER TABLE ${dialect.quote(table)} VALIDATE CONSTRAINT ${dialect.quote(name)}`,
+
   addUnique: (table, name, column) =>
     `ALTER TABLE ${dialect.quote(table)} ADD CONSTRAINT ${dialect.quote(name)} UNIQUE (${dialect.quote(column)})`,
 
@@ -236,6 +239,7 @@ const dialect: Dialect = {
        deciding whether anything changed. */
     const result = await db.query(
       `SELECT c.conname,
+              c.convalidated,
               pg_get_constraintdef(c.oid) AS condef,
               d.description AS declared
          FROM pg_constraint c
@@ -249,7 +253,7 @@ const dialect: Dialect = {
     return Object.fromEntries(
       result.rows.map((row: any) => [
         row.conname,
-        { definition: row.condef, declared: row.declared ?? null },
+        { definition: row.condef, declared: row.declared ?? null, validated: row.convalidated !== false },
       ]),
     );
   },

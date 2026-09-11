@@ -802,6 +802,83 @@ export class SchemaBuilder {
   }
 
   /**
+   * Loosen-phase half of changing a check: the old one is replaced by one
+   * that admits what either declaration admits, `(old) OR (new)`.
+   *
+   * Replacing a stored value — `'web'` becoming `'html'`, say — needs the new
+   * value writable while the old one is still in the rows, which is exactly
+   * when an effect runs. Left in place, the old check refuses the effect's
+   * UPDATE whenever the new value is not on the old list. Dropped outright,
+   * the table is unguarded, and stays so if the effect then fails. The union
+   * is the DBA's widen → migrate → narrow, done by sync: the tighten phase
+   * puts the new declaration on and removes the stand-in.
+   */
+  private async widenChangedChecks(entityName: string, schema: SchemaOptions) {
+    if (!schema.checks?.length || !this.dialect.describeCheck || !this.dialect.supportsUnvalidatedCheck) return;
+    const existing = await this.dialect.listChecks(this.connection, entityName);
+    const table = this.dialect.quote(entityName);
+
+    for (const chk of schema.checks) {
+      const current = existing[chk.name];
+      if (!current || current.declared === null || current.declared.trim() === chk.expression.trim()) continue;
+
+      const wide = `${chk.name}_ecosy_wide`;
+      currentLogger().info(`[DB] Check ${chk.name} on ${entityName} changed — admitting old and new values while effects run.`);
+      if (existing[wide]) await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(wide)}`);
+      /* NOT VALID: the stand-in lives for the length of one sync, and the rows
+         already satisfy the old half — there is nothing to scan for. */
+      await this.connection.query(this.checkStatement(
+        entityName,
+        { name: wide, expression: `(${current.declared}) OR (${chk.expression})` },
+        false,
+      ));
+      await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(chk.name)}`);
+    }
+  }
+
+  /** Adds a check; over rows that break it, adds it NOT VALID and says what that costs. */
+  private async addCheck(entityName: string, chk: { name: string; expression: string }) {
+    try {
+      await this.connection.query(this.checkStatement(entityName, chk));
+    } catch (error: any) {
+      if (error?.code !== "23514" || !this.dialect.supportsUnvalidatedCheck) throw error;
+      await this.connection.query(this.checkStatement(entityName, chk, false));
+      await this.explainUnvalidated(entityName, chk);
+    }
+  }
+
+  private async validateOrExplain(entityName: string, chk: { name: string; expression: string }) {
+    if (!this.dialect.validateCheck) return;
+    try {
+      await this.connection.query(this.dialect.validateCheck(entityName, chk.name));
+      currentLogger().info(`[DB] Check ${chk.name} on ${entityName} validated — every row satisfies it now.`);
+    } catch (error: any) {
+      if (error?.code !== "23514") throw error;
+      await this.explainUnvalidated(entityName, chk);
+    }
+  }
+
+  /**
+   * The warning for a check left NOT VALID, which used to say "new writes are
+   * checked" — true, and misleading enough to take sniprender down: NOT VALID
+   * checks every UPDATE too, so each of the old rows fails the moment anything
+   * writes to it. It says that now, with the count.
+   */
+  private async explainUnvalidated(entityName: string, chk: { name: string; expression: string }) {
+    const bad = await this.connection.query(
+      `SELECT count(*) AS n FROM ${this.dialect.quote(entityName)} WHERE NOT (${chk.expression})`,
+    );
+    const n = Number(bad.rows[0]?.n ?? 0);
+    currentLogger().warn(
+      `[DB] Check ${chk.name} on ${entityName} is NOT VALID: ${n} existing row${n === 1 ? "" : "s"} ` +
+        `do${n === 1 ? "es" : ""} not satisfy ${chk.expression}. Postgres checks every write against ` +
+        `it — including any UPDATE to one of those rows, which fails with 23514 until the row is ` +
+        `fixed. Replace the values from an effect on the entity; sync validates the check once ` +
+        `every row satisfies it.`,
+    );
+  }
+
+  /**
    * Brings one table in line with its entity.
    *
    * On an existing table the work runs in three phases, and the order is the
@@ -929,6 +1006,7 @@ export class SchemaBuilder {
        effects so they, and the fill below, see the default the entity now
        declares rather than the one the table had. */
     await this.reconcileDefaults(entityName, defaults);
+    await this.widenChangedChecks(entityName, schema);
 
     await runEffects();
 
@@ -1171,10 +1249,24 @@ export class SchemaBuilder {
       const existing = existingChecks[chk.name];
 
       if (!existing) {
-        await this.connection.query(this.checkStatement(entityName, chk));
+        await this.addCheck(entityName, chk);
         if (describe) {
           await this.connection.query(describe(entityName, chk.name, chk.expression));
         }
+        /* A widened stand-in from the loosen phase has done its job. */
+        const wide = `${chk.name}_ecosy_wide`;
+        if (existingChecks[wide]) {
+          await this.connection.query(`ALTER TABLE ${table} DROP CONSTRAINT ${this.dialect.quote(wide)}`);
+          delete existingChecks[wide];
+        }
+        continue;
+      }
+
+      /* Declared as before, but still NOT VALID — added over rows that broke
+         it. Once they are fixed (by an effect, typically, which has just run)
+         validating is all that is left, and nobody should have to remember to. */
+      if (existing.validated === false && describe && existing.declared?.trim() === chk.expression.trim()) {
+        await this.validateOrExplain(entityName, chk);
         continue;
       }
 
@@ -1238,11 +1330,7 @@ export class SchemaBuilder {
             this.checkStatement(entityName, { ...chk, name: staging }, false),
           );
 
-          currentLogger().warn(
-            `[DB] ${entityName}.${chk.name} added NOT VALID: existing rows do not all ` +
-              `satisfy ${chk.expression}. New writes are checked; migrate the old rows ` +
-              `and run VALIDATE CONSTRAINT to finish.`,
-          );
+          await this.explainUnvalidated(entityName, { ...chk, name: chk.name });
         }
 
         await this.connection.query(

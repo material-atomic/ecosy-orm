@@ -138,7 +138,10 @@ export interface Dialect {
   listChecks(
     db: Queryable,
     table: string,
-  ): Promise<Record<string, { definition: string; declared: string | null }>>;
+  ): Promise<Record<string, { definition: string; declared: string | null; validated?: boolean }>>;
+
+  /** Validates a check added NOT VALID, once every row satisfies it. */
+  validateCheck?(table: string, name: string): string;
 
   /**
    * Records, next to the constraint, the expression the entity declared.
