@@ -260,7 +260,7 @@ export interface SyncOptions {
   /**
    * Whether sync may remove what the entity no longer declares.
    *
-   * `"additive"` (the default from 2.0) never removes: a column, index, check,
+   * `"additive"` (the default from 1.2.0) never removes: a column, index, check,
    * foreign key, unique constraint or default the entity stopped declaring is
    * kept, and named in one warning per entity. A kept column that is NOT NULL
    * is made nullable — loosening, not removing — so inserts that no longer
