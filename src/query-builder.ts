@@ -154,17 +154,54 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return { sql, params };
   }
 
+  /**
+   * The columns a batch writes: every key some row gives a value, in first-seen
+   * order.
+   *
+   * The UNION of every row's keys, not the first row's. Taking row 0 dropped a
+   * field that only later rows carried, and turned a field missing from a later
+   * row into NULL — which surfaced as a not-null violation naming the column
+   * rather than the real cause, a row whose shape differed.
+   *
+   * A key whose value is `undefined` does not count as given. `pg` sends
+   * `undefined` as NULL, so counting it wrote NULL over the column's DEFAULT on
+   * insert and over the stored value on update — the second one erasing data
+   * with no error, from code that only meant "I have nothing for this".
+   */
+  private givenKeys(arr: PartialInput<Entity>[]): string[] {
+    return this.known([
+      ...new Set(
+        arr.flatMap((row) =>
+          Object.entries(row).filter(([, v]) => v !== undefined).map(([k]) => k),
+        ),
+      ),
+    ]);
+  }
+
   buildInsert(arr: PartialInput<Entity>[]): { sql: string, params: any[] } {
     if (!arr.length) return { sql: "", params: [] };
-    /* The UNION of every row's keys, not the first row's. Taking row 0 dropped
-       a field that only later rows carried, and turned a field missing from a
-       later row into NULL — which surfaced as a not-null violation naming the
-       column rather than the real cause, a row whose shape differed. */
-    const tsKeys = this.known([...new Set(arr.flatMap((row) => Object.keys(row)))]);
+    const tsKeys = this.givenKeys(arr);
+
+    /* Nothing given at all: every column takes its default. `() VALUES ()` is
+       not SQL, and one statement per row keeps the batch a batch. */
+    if (!tsKeys.length) {
+      if (arr.length === 1) {
+        return { sql: `INSERT INTO ${this.entityName} DEFAULT VALUES` + this.returning(), params: [] };
+      }
+      throw new Error(
+        `[QueryBuilder] insert() on "${this.entityName}" got ${arr.length} rows with no values ` +
+          `in any of them. Insert them one at a time, or give at least one column a value.`,
+      );
+    }
+
     const params: any[] = [];
     const values = arr.map(obj => {
       return `(${tsKeys.map(c => {
-        params.push(this.encode(c, (obj as any)[c]));
+        const value = (obj as any)[c];
+        /* This row has nothing for a column another row fills. DEFAULT, not
+           NULL: the row said nothing, so the schema decides. */
+        if (value === undefined) return "DEFAULT";
+        params.push(this.encode(c, value));
         return `${this.dialect.placeholder(params.length)}`;
       }).join(", ")})`;
     }).join(", ");
@@ -177,8 +214,15 @@ export class QueryBuilder<Entity extends BaseEntity> {
 
   buildUpdate(where: FindWhereOptions<Entity>, data: PartialInput<Entity>): { sql: string, params: any[] } {
     const params: any[] = [];
-    const assignments = Object.entries(data)
-      .filter(([tsKey]) => tsKey in this.schema.columns)
+    const given = Object.entries(data).filter(
+      ([tsKey, v]) => tsKey in this.schema.columns && v !== undefined,
+    );
+
+    /* Nothing to write. An empty SET is a syntax error, and the honest answer
+       to "update nothing" is no statement — the repository reports zero rows. */
+    if (!given.length) return { sql: "", params: [] };
+
+    const assignments = given
       .map(([tsKey, v]) => {
         params.push(this.encode(tsKey, v));
         return `${this.q(this.dbCol(tsKey))} = ${this.dialect.placeholder(params.length)}`;
@@ -207,11 +251,23 @@ export class QueryBuilder<Entity extends BaseEntity> {
 
   buildUpsert(arr: PartialInput<Entity>[], conflictColumns: string[]): { sql: string, params: any[] } {
     if (!arr.length) return { sql: "", params: [] };
-    /* The UNION of every row's keys, not the first row's. Taking row 0 dropped
-       a field that only later rows carried, and turned a field missing from a
-       later row into NULL — which surfaced as a not-null violation naming the
-       column rather than the real cause, a row whose shape differed. */
-    const tsKeys = this.known([...new Set(arr.flatMap((row) => Object.keys(row)))]);
+    const tsKeys = this.givenKeys(arr);
+
+    /* An insert can fill a gap with DEFAULT; an upsert cannot. On conflict the
+       row is updated from EXCLUDED, and EXCLUDED of a DEFAULT cell is the
+       default — so a row that only lacked a value would overwrite the stored
+       one with it. Refused instead of doing that quietly. */
+    for (const c of tsKeys) {
+      const missing = arr.filter((row) => (row as any)[c] === undefined).length;
+      if (missing) {
+        throw new Error(
+          `[QueryBuilder] upsert() on "${this.entityName}": ${missing} of ${arr.length} rows ` +
+            `have no value for "${c}" while others do. On conflict that row would overwrite ` +
+            `the stored "${c}" with its default. Give every row the same fields, or split the batch.`,
+        );
+      }
+    }
+
     const params: any[] = [];
     const values = arr.map(obj => {
       return `(${tsKeys.map(c => {
@@ -276,11 +332,11 @@ export class SchemaBuilder {
     private sync: SyncOptions = safeSyncOptions(),
   ) {}
 
-  private columnDefinition(opt: any, withPrimaryKey: boolean) {
+  private columnDefinition(opt: any, withPrimaryKey: boolean, withNotNull = true) {
     let def = `${this.dialect.quote(opt.name)} ${opt.type}`;
     if (withPrimaryKey && opt.primaryKey) def += " PRIMARY KEY";
     if (opt.unique) def += " UNIQUE";
-    if (opt.notNull) def += " NOT NULL";
+    if (opt.notNull && withNotNull) def += " NOT NULL";
     if (opt.default) def += ` DEFAULT ${opt.default}`;
     if (opt.references) def += ` REFERENCES ${opt.references}`;
     return def;
@@ -418,8 +474,29 @@ export class SchemaBuilder {
     return out;
   }
 
-  async syncSchema(entityName: string, schema: SchemaOptions) {
+  /**
+   * Brings one table in line with its entity.
+   *
+   * On an existing table the work runs in three phases, and the order is the
+   * point: first everything that only loosens or adds — renames, new columns,
+   * retypes, `DROP NOT NULL`; then the entity's effects; then everything that
+   * tightens or removes — `SET NOT NULL`, dropped columns, foreign keys,
+   * checks. A constraint the existing rows do not yet satisfy is the reason a
+   * boot fails, and the middle phase is the one place data can be brought up
+   * to it: the column exists, and nothing refuses the table yet.
+   *
+   * @param EntityClass The entity, when there is one, for its `effects`.
+   */
+  async syncSchema(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {
     const table = this.dialect.quote(entityName);
+    const runEffects = async () => {
+      if (!(EntityClass as { effects?: unknown[] } | undefined)?.effects?.length) return;
+      /* Imported here, not at the top: effects need a repository, a
+         repository needs this module, and a cycle in a package whose root
+         re-exports both is a class that is undefined when the other loads. */
+      const effects = await import("./effects");
+      await effects.runEffects(EntityClass);
+    };
     const previous = await this.snapshot(entityName);
 
     if (!(await this.dialect.tableExists(this.connection, entityName))) {
@@ -446,6 +523,11 @@ export class SchemaBuilder {
 
       await this.saveSnapshot(entityName, schema);
 
+      /* A new table has no rows to bring up to anything, but a `"once"`
+         effect still runs — and is recorded — here, so it does not wait for a
+         later boot to find data it was never meant for. */
+      await runEffects();
+
       return;
     }
 
@@ -464,15 +546,23 @@ export class SchemaBuilder {
     }
 
     const added: string[] = [];
+    /* Columns that must become NOT NULL once the effects have had their turn. */
+    const tighten: { dbCol: string; opt: any }[] = [];
 
     for (const [, opt] of Object.entries(schema.columns)) {
       const dbCol = opt.name as string;
 
       if (!existingCols[dbCol]) {
         added.push(dbCol);
+        /* With a DEFAULT the new column is filled as it is added, so NOT NULL
+           can go on in the same statement. Without one, every existing row
+           holds NULL — adding it NOT NULL there fails outright on any table
+           with data, which is exactly the table an effect exists to fill. */
+        const deferNotNull = Boolean(opt.notNull) && !opt.default;
         await this.connection.query(
-          `ALTER TABLE ${table} ADD COLUMN ${this.columnDefinition(opt, false)}`,
+          `ALTER TABLE ${table} ADD COLUMN ${this.columnDefinition(opt, false, !deferNotNull)}`,
         );
+        if (deferNotNull) tighten.push({ dbCol, opt });
         continue;
       }
 
@@ -481,10 +571,12 @@ export class SchemaBuilder {
       if (opt.primaryKey) continue;
 
       const isNotNull = !existingCols[dbCol].nullable;
-      if (Boolean(opt.notNull) !== isNotNull) {
+      if (!opt.notNull && isNotNull) {
         await this.connection.query(
-          this.dialect.alterNullable(entityName, dbCol, opt.type as string, Boolean(opt.notNull)),
+          this.dialect.alterNullable(entityName, dbCol, opt.type as string, false),
         );
+      } else if (opt.notNull && !isNotNull) {
+        tighten.push({ dbCol, opt });
       }
 
       /* The engine reports its own name for a type — `character varying` for
@@ -499,6 +591,30 @@ export class SchemaBuilder {
           this.dialect.alterType(entityName, dbCol, opt.type as string),
         );
       }
+    }
+
+    await runEffects();
+
+    for (const { dbCol, opt } of tighten) {
+      /* Counted first so the failure names what to do. Left to the engine it
+         reads "column contains null values" and stops the boot — the error
+         sniprender met when `projects.code` became required over rows that
+         predated it. */
+      const nulls = await this.connection.query(
+        `SELECT count(*) AS n FROM ${table} WHERE ${this.dialect.quote(dbCol)} IS NULL`,
+      );
+      const n = Number(nulls.rows[0]?.n ?? 0);
+      if (n > 0) {
+        throw new Error(
+          `[DB] ${entityName}.${dbCol} is declared notNull, but ${n} existing ` +
+            `row${n === 1 ? "" : "s"} hold${n === 1 ? "s" : ""} NULL. Fill them from an effect on the ` +
+            `entity — \`static effects\` with when: "sync" or "once" — which runs after the column ` +
+            `exists and before this constraint is applied. Or give the column a DEFAULT.`,
+        );
+      }
+      await this.connection.query(
+        this.dialect.alterNullable(entityName, dbCol, opt.type as string, true),
+      );
     }
 
     /* Columns the entity no longer declares. This is the half that makes sync

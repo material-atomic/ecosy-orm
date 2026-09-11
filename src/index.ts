@@ -3,6 +3,7 @@ export * from "./entity";
 export * from "./query-builder";
 export * from "./repository";
 export * from "./transaction";
+export type { EntityEffect, EffectContext } from "./effects";
 /* The contract only. Built-in drivers live on their own subpaths and load
    their client package by dynamic import, so the root never pulls one in. */
 export type * from "./drivers/types";

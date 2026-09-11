@@ -75,7 +75,7 @@ export class DataSource {
     for (const EntityClass of this._entities) {
       if (EntityClass.entityName && EntityClass.schema) {
         try {
-          await schemaBuilder.syncSchema(EntityClass.entityName, EntityClass.schema);
+          await schemaBuilder.syncSchema(EntityClass.entityName, EntityClass.schema, EntityClass);
         } catch (error) {
           currentLogger().error(`[DB] Failed to sync schema for ${EntityClass.entityName}`, error);
           throw error;

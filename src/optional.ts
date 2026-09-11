@@ -13,8 +13,10 @@
  *
  * Nothing is wrong there. The caller computed a value that may be absent and
  * passed it, which is what `undefined` is for, and the library treats a missing
- * key and an undefined one identically anyway — a column set to `undefined` is
- * simply not written.
+ * key and an undefined one identically — a column set to `undefined` is not
+ * written: an insert leaves it to the column's DEFAULT, an update leaves the
+ * stored value alone. (Before 1.2.0 this sentence was false. `pg` sends
+ * `undefined` as NULL, and an update with `{ code: maybe }` erased the column.)
  *
  * So input types say `| undefined` explicitly. It is not a way around the
  * flag; it is the flag being told the truth about what these functions accept.

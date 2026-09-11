@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { PartialInput } from "./optional";
 import type { Repository, FindWhereOptions, ColumnOptions, IndexOptions, CheckOptions } from "./repository";
+import type { EntityEffect } from "./effects";
 
 export type InferColumnType<T extends string> = 
   T extends "TEXT" | "UUID" ? string :
@@ -20,6 +21,8 @@ export type EntityConstructor<T extends Entity = Entity> = {
   readonly entityName: string;
   readonly schema: { columns: Record<string, ColumnOptions>; indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[] };
   hydrate: typeof Entity.hydrate;
+  /** Declared as a static on a subclass. See {@link EntityEffect}. */
+  readonly effects?: readonly EntityEffect<any>[];
 };
 
 export abstract class Entity {
@@ -33,6 +36,48 @@ export abstract class Entity {
   readonly _repository?: Repository<this>;
 
   /**
+   * Runs before a row is inserted, with `this` as the row about to be written.
+   * Whatever it assigns is written; whatever it leaves `undefined` falls back
+   * to the column's default.
+   *
+   * Called for `insert()`, for `upsert()` — a row there may become an insert,
+   * and a `NOT NULL` column it fills is needed either way — and for `save()`
+   * on a row with no primary key. It is not called for SQL written by hand.
+   *
+   * May be async; rows of a multi-row insert are prepared one after another,
+   * then written in one statement.
+   *
+   * @example
+   * class ProjectEntity extends Entity.create("projects", configs) {
+   *   beforeInsert() {
+   *     this.code ??= crypto.randomUUID().slice(0, 8);
+   *   }
+   * }
+   */
+  beforeInsert?(): void | Promise<void>;
+
+  /**
+   * Runs before an update, with `this` holding **only the fields being
+   * written** — `update(where, patch)` is addressed by a WHERE clause that may
+   * match many rows or none, so there is no single row to hand over. The one
+   * exception is `save()`, which writes the whole instance.
+   *
+   * @example
+   * beforeUpdate() {
+   *   this.updatedAt = new Date().toISOString();
+   * }
+   */
+  beforeUpdate?(): void | Promise<void>;
+
+  /**
+   * Runs on every row read back — `find`, `findOne`, and the rows `insert` and
+   * `upsert` return. Synchronous on purpose: it runs once per row of every
+   * query, and an await there is paid ten thousand times on a large page.
+   * Prefer a getter for anything that can be computed when it is read.
+   */
+  afterLoad?(): void;
+
+  /**
    * Builds an entity from a database row and attaches the repository it came
    * from, which is what makes `row.save()` and `row.delete()` possible.
    */
@@ -43,6 +88,18 @@ export abstract class Entity {
   ): T {
     const instance = new this();
     Object.assign(instance, data);
+
+    if (typeof instance.afterLoad === "function") {
+      const result: unknown = instance.afterLoad();
+      /* A floating promise here would be a hook that silently never finished
+         before the row was used. */
+      if (result && typeof (result as Promise<unknown>).then === "function") {
+        throw new Error(
+          `[Entity] afterLoad() returned a promise. It must be synchronous: it runs on every ` +
+            `row of every query. Compute on read with a getter, or load in the repository.`,
+        );
+      }
+    }
 
     /* defineProperty rather than assignment, for `enumerable: false`: the
        reference has to be invisible to `JSON.stringify`, to spreads and to

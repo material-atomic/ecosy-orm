@@ -6,6 +6,7 @@ import path from "node:path";
 import { DataSource } from "./data-source";
 import { SchemaBuilder } from "./query-builder";
 import { currentLogger } from "./logger";
+import { withLock } from "./lock";
 
 const connection = new DataSource();
 
@@ -94,55 +95,13 @@ async function runSqlFiles(dirPath: string, trackingTable: string) {
   }
 }
 
-/**
- * Runs `fn` while holding a named lock, so two processes booting at once do not
- * both decide the same migration has not run yet.
- *
- * The lock is taken on a connection this function keeps checked out, because an
- * advisory lock belongs to a session: taking it through a pooled query would
- * return the connection — and release the lock — before the work even starts.
- * That is the same mistake the migration loop above used to make, in a
- * different costume.
- *
- * An engine whose dialect declares no advisory lock runs unguarded, and says so
- * rather than implying a protection it does not have.
- */
-async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const dialect = DataSource.dialect;
-
-  if (!dialect.advisoryLock || !dialect.advisoryUnlock) {
-    currentLogger().warn(
-      `[DB] Driver "${DataSource.current.name}" exposes no advisory lock, so migrations run ` +
-        `unguarded. Two processes booting together may run the same file twice.`,
-    );
-    return fn();
-  }
-
-  const holder = await DataSource.transaction();
-
-  try {
-    await holder.query(dialect.advisoryLock(key));
-    return await fn();
-  } finally {
-    /* Commit releases the connection, and the session lock with it; the unlock
-       is explicit anyway so the intent survives a future change to how the
-       transaction is closed. */
-    try {
-      await holder.query(dialect.advisoryUnlock(key));
-    } catch {
-      /* Losing the unlock is not worth masking whatever `fn` threw. */
-    }
-    await holder.commit();
-  }
-}
-
 export async function syncEntities(entityClasses: any[]) {
   currentLogger().info("[DB] Syncing schemas from entities...");
   const schemaBuilder = new SchemaBuilder(connection);
   for (const EntityClass of entityClasses) {
     if (EntityClass.entityName && EntityClass.schema) {
       try {
-        await schemaBuilder.syncSchema(EntityClass.entityName, EntityClass.schema);
+        await schemaBuilder.syncSchema(EntityClass.entityName, EntityClass.schema, EntityClass);
         currentLogger().info(`[DB] Synced schema for ${EntityClass.name || EntityClass.entityName}`);
       } catch (error) {
         currentLogger().error(`[DB] Failed to run sync query for ${EntityClass.name || EntityClass.entityName}:`, error);

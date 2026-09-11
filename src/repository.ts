@@ -228,8 +228,39 @@ export abstract class Repository<Entity extends BaseEntity> {
     return rows.map(row => (this.entityClass as any).hydrate(row, this));
   }
 
+  /**
+   * Runs `beforeInsert` or `beforeUpdate` over each row, if the entity
+   * declares it, and returns what the hook left behind.
+   *
+   * The hook gets a real instance as `this` — the same class `find` returns —
+   * so it reads and assigns fields as it would anywhere else. What comes back
+   * is the instance's own fields, which the builder then filters to declared
+   * columns; nothing a hook adds that is not a column reaches the SQL.
+   *
+   * Entities without the hook skip all of this, and pay nothing for it.
+   */
+  protected async prepare(
+    rows: PartialInput<Entity>[],
+    hook: "beforeInsert" | "beforeUpdate",
+  ): Promise<PartialInput<Entity>[]> {
+    if (typeof (this.entityClass.prototype as any)[hook] !== "function") return rows;
+
+    const prepared: PartialInput<Entity>[] = [];
+    for (const row of rows) {
+      const instance = new this.entityClass();
+      Object.assign(instance, row);
+      await (instance as any)[hook]();
+      prepared.push({ ...(instance as any) });
+    }
+    return prepared;
+  }
+
+  /**
+   * Brings this entity's table in line with its schema, running the entity's
+   * effects at the point sync leaves room for them. See {@link EntityEffect}.
+   */
   async syncSchema() {
-    await this.schemaBuilder.syncSchema(this.entityName, this.schema);
+    await this.schemaBuilder.syncSchema(this.entityName, this.schema, this.entityClass);
   }
 
   async find(options: FindOptions<Entity>): Promise<Entity[]> {
@@ -248,7 +279,7 @@ export abstract class Repository<Entity extends BaseEntity> {
   async insert(data: PartialInput<Entity>[]): Promise<Entity[]>;
   async insert(data: PartialInput<Entity> | PartialInput<Entity>[]): Promise<Entity | Entity[] | null> {
     const isArray = Array.isArray(data);
-    const arr = isArray ? data : [data];
+    const arr = await this.prepare(isArray ? data : [data], "beforeInsert");
     if (!arr.length) return isArray ? [] : null;
     
     const { sql, params } = this.queryBuilder.buildInsert(arr);
@@ -257,8 +288,17 @@ export abstract class Repository<Entity extends BaseEntity> {
     return isArray ? this.hydrateRows(result.rows) : this.hydrateRows(result.rows)[0];
   }
 
-  update(where: FindWhereOptions<Entity>, data: PartialInput<Entity>) {
-    const { sql, params } = this.queryBuilder.buildUpdate(where, data);
+  /**
+   * Updates every row matching `where`.
+   *
+   * A field set to `undefined` is not written — the column keeps what it had.
+   * A patch with nothing left to write (after `beforeUpdate`) runs no statement
+   * and reports no rows, rather than sending `SET` with nothing after it.
+   */
+  async update(where: FindWhereOptions<Entity>, data: PartialInput<Entity>) {
+    const [patch] = await this.prepare([data], "beforeUpdate");
+    const { sql, params } = this.queryBuilder.buildUpdate(where, patch!);
+    if (!sql) return { rows: [], rowCount: 0 };
     return this.connection.query(sql, params);
   }
 
@@ -271,7 +311,7 @@ export abstract class Repository<Entity extends BaseEntity> {
   async upsert(data: PartialInput<Entity>[], conflictColumns: string[]): Promise<Entity[]>;
   async upsert(data: PartialInput<Entity> | PartialInput<Entity>[], conflictColumns: string[]): Promise<Entity | Entity[] | null> {
     const isArray = Array.isArray(data);
-    const arr = isArray ? data : [data];
+    const arr = await this.prepare(isArray ? data : [data], "beforeInsert");
     if (!arr.length) return isArray ? [] : null;
     
     const { sql, params } = this.queryBuilder.buildUpsert(arr, conflictColumns);
