@@ -8,7 +8,7 @@ import { currentDialect, currentDriver } from "./drivers/current";
 import { DataSource } from "./data-source";
 import { Transaction } from "./transaction";
 import { withLock } from "./lock";
-import { syncContext } from "./sync-context";
+import { isSyncing, withinFrame } from "./sync-context";
 
 
 /** Which rows an operation reaches on a soft-deleting entity. */
@@ -951,22 +951,14 @@ export class SchemaBuilder {
        which is released only when that effect returns. Caught by call chain,
        not by a process-wide set: concurrent syncs of one entity, which the
        lock serialises, are fine; only a sync nested inside itself is not. */
-    const chain = await syncContext();
-    const active = chain.getStore()?.syncing;
-    if (active?.has(entityName)) {
+    if (await isSyncing(entityName)) {
       throw new Error(
         `[DB] syncSchema("${entityName}") was called from inside the sync of ${entityName} — from ` +
           `one of its effects, most likely. It would wait forever for the lock the outer sync ` +
           `holds. An effect already runs mid-sync; do the work in it directly.`,
       );
     }
-    const nested = new Set(active ?? []);
-    nested.add(entityName);
-
-    /* `effect: null` — a sync started from inside an effect (of another
-       entity) is sync code again, with its own locks and its own statements
-       on the pool, and is not held to the effect's rule. */
-    return chain.run({ syncing: nested, effect: null }, () => this.syncLocked(entityName, schema, EntityClass));
+    return withinFrame("sync", entityName, () => this.syncLocked(entityName, schema, EntityClass));
   }
 
   private syncLocked(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {

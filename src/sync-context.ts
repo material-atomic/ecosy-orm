@@ -16,32 +16,69 @@
  * side by side are legitimate — the lock serialises them — and a process-wide
  * set would mistake them for nesting.
  *
+ * The chain is a list of frames, each closed when its sync or effect returns.
+ * AsyncLocalStorage hands the current frame to everything started under it —
+ * timers, listeners, promises nobody awaits — and those can outlive the frame
+ * by the life of the process. A flag set once and never cleared would forbid a
+ * cache that happened to be first touched inside an effect from ever using the
+ * pool again, with an error naming an effect long finished. Closed frames are
+ * skipped, so such work sees the chain as it is now, not as it was.
+ *
  * `node:async_hooks` is imported on first use, not here. This module is on the
  * root entry, and a static import would put a Node builtin in the graph of
  * everything that imports @ecosy/orm for a type.
  */
 import type { AsyncLocalStorage } from "node:async_hooks";
 
-export interface SyncContext {
-  /** Entities whose sync is in progress on this chain. */
-  syncing: ReadonlySet<string>;
-  /** `entity:effect`, while an effect's own code runs. */
-  effect: string | null;
+export interface Frame {
+  kind: "sync" | "effect";
+  /** The entity for a sync; `entity:effect` for an effect. */
+  name: string;
+  parent: Frame | undefined;
+  open: boolean;
 }
 
-let storage: AsyncLocalStorage<SyncContext> | null = null;
+let storage: AsyncLocalStorage<Frame> | null = null;
 
-export async function syncContext(): Promise<AsyncLocalStorage<SyncContext>> {
+async function chain(): Promise<AsyncLocalStorage<Frame>> {
   if (!storage) {
     const hooks = await import("node:async_hooks");
-    storage ??= new hooks.AsyncLocalStorage<SyncContext>();
+    storage ??= new hooks.AsyncLocalStorage<Frame>();
   }
   return storage;
 }
 
-/** Synchronous read. Null until the first sync has loaded the storage. */
-export function currentSyncContext(): SyncContext | undefined {
-  return storage?.getStore();
+/** Runs `fn` inside a new frame under the current one, and closes it however `fn` ends. */
+export async function withinFrame<T>(kind: Frame["kind"], name: string, fn: () => Promise<T>): Promise<T> {
+  const store = await chain();
+  const frame: Frame = { kind, name, parent: store.getStore(), open: true };
+  try {
+    return await store.run(frame, fn);
+  } finally {
+    frame.open = false;
+  }
+}
+
+/** Whether a sync of `entity` is still running somewhere up this chain. */
+export async function isSyncing(entity: string): Promise<boolean> {
+  for (let f = (await chain()).getStore(); f; f = f.parent) {
+    if (f.open && f.kind === "sync" && f.name === entity) return true;
+  }
+  return false;
+}
+
+/**
+ * The effect whose own code is running, if any: the nearest open frame
+ * decides. A sync started from inside an effect is sync code again — with its
+ * own locks and statements on the pool — so an open sync frame shadows an
+ * effect frame above it.
+ */
+export function currentEffect(): string | null {
+  for (let f = storage?.getStore(); f; f = f.parent) {
+    if (!f.open) continue;
+    return f.kind === "effect" ? f.name : null;
+  }
+  return null;
 }
 
 /**
@@ -51,7 +88,7 @@ export function currentSyncContext(): SyncContext | undefined {
  * is sent, rather than sent and left waiting.
  */
 export function refuseInsideEffect(what: string): void {
-  const effect = currentSyncContext()?.effect;
+  const effect = currentEffect();
   if (!effect) return;
   throw new Error(
     `[DB] ${what} reached the pool from inside effect ${effect}. That runs outside the effect's ` +

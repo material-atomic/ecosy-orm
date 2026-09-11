@@ -5,7 +5,7 @@ import { DataSource } from "./data-source";
 import { currentLogger } from "./logger";
 import { createRepository, type Repository } from "./repository";
 import { withLock } from "./lock";
-import { currentSyncContext, syncContext } from "./sync-context";
+import { withinFrame } from "./sync-context";
 
 /** What an effect is handed. Both halves are bound to the effect's own transaction. */
 export interface EffectContext<T extends Entity = Entity> {
@@ -130,12 +130,9 @@ export async function runEffects(EntityClass: any): Promise<void> {
 
           /* The effect's own code runs marked as such, so a statement it sends
              to the pool instead of to `tx` is refused — see sync-context. */
-          const chain = await syncContext();
-          const outer = currentSyncContext();
-          await chain.run(
-            { syncing: outer?.syncing ?? new Set(), effect: `${entityName}:${effect.name}` },
-            () => effect.run({ repository: createRepository(EntityClass).using(tx) as any, tx }),
-          );
+          await withinFrame("effect", `${entityName}:${effect.name}`, async () => {
+            await effect.run({ repository: createRepository(EntityClass).using(tx) as any, tx });
+          });
 
           if (effect.when === "once") {
             await tx.query(

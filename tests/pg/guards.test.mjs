@@ -79,6 +79,42 @@ section("an effect that goes to the pool instead of its transaction");
   eq("an afterCommit callback, running after the effect, may use the pool", afterCommitRan, true);
 }
 
+section("work an effect starts outlives it — and so must not carry its mark");
+{
+  /* sniprender's repro: a lazily started cache or scheduler, first touched
+     inside an effect. AsyncLocalStorage hands the effect's frame to its timer;
+     the frame has to read as closed once the effect returns. */
+  const db = new DataSource();
+  const results = {};
+  let scheduled = false;
+  class Leak extends Entity.create("gd_leak", { columns: cols }) {
+    static effects = [{
+      name: "starts-background-work", when: "sync",
+      run: async () => {
+        if (scheduled) return;
+        scheduled = true;
+        setTimeout(async () => {   // fires while the effect is still running
+          try { await new DataSource().query(`SELECT 1`); results.during = "allowed"; }
+          catch { results.during = "refused"; }
+        }, 10);
+        setTimeout(async () => {   // fires after the effect has returned
+          try { await new DataSource().query(`SELECT 1`); results.after = "allowed"; }
+          catch (e) { results.after = `refused: ${e.message.slice(0, 60)}`; }
+          try { await createRepository(Leak).syncSchema(); results.resync = "allowed"; }
+          catch (e) { results.resync = `refused: ${e.message.slice(0, 60)}`; }
+        }, 150);
+        await new Promise((r) => setTimeout(r, 60));
+      },
+    }];
+  }
+  await createRepository(Leak).syncSchema();
+  await new Promise((r) => setTimeout(r, 400));
+  eq("a timer firing while the effect runs is still refused the pool", results.during, "refused");
+  eq("a timer firing after the effect returned may use the pool", results.after, "allowed");
+  eq("…and may sync that entity again — not mistaken for nesting", results.resync, "allowed");
+  eq("the boot code after sync uses the pool as before", (await db.query(`SELECT 1 AS ok`)).rows[0].ok, 1);
+}
+
 section("a pool too small for what sync holds at once");
 {
   /* The pool itself is shared and already open; what is checked is the size
