@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { PartialInput } from "./optional";
-import type { Entity as BaseEntity, EntityConstructor } from "./entity";
+import type { Entity as BaseEntity, EntityConstructor, HookContext } from "./entity";
 import { DataSource } from "./data-source";
 import { Transaction } from "./transaction";
 import type { Queryable } from "./drivers/types";
@@ -234,6 +234,24 @@ export abstract class Repository<Entity extends BaseEntity> {
     return rows.map(row => (this.entityClass as any).hydrate(row, this));
   }
 
+  /**
+   * What a hook is handed. Hooks only ever run inside {@link atomically}, so
+   * `connection` is a transaction here — the caller's or one opened for the
+   * write — and there is always a commit to attach to.
+   */
+  protected hookContext(): HookContext {
+    const tx = this.connection;
+    return {
+      db: tx,
+      afterCommit: (fn) => {
+        if (!(tx instanceof Transaction)) {
+          throw new Error("[Repository] afterCommit called outside a transaction.");
+        }
+        tx.afterCommit(fn);
+      },
+    };
+  }
+
   /** Whether the entity declares this lifecycle hook. */
   protected has(hook: WriteHook): boolean {
     return typeof (this.entityClass.prototype as any)[hook] === "function";
@@ -272,7 +290,7 @@ export abstract class Repository<Entity extends BaseEntity> {
     for (const row of rows) {
       const instance = new this.entityClass();
       Object.assign(instance, row);
-      await (instance as any)[hook]({ db: this.connection });
+      await (instance as any)[hook](this.hookContext());
       prepared.push({ ...(instance as any) });
     }
     return prepared;
@@ -281,7 +299,8 @@ export abstract class Repository<Entity extends BaseEntity> {
   /** Runs an after-hook, or `beforeRemove`, over rows already read back. In order, one at a time. */
   protected async each(rows: Entity[], hook: WriteHook) {
     if (!this.has(hook)) return;
-    for (const row of rows) await (row as any)[hook]({ db: this.connection });
+    const context = this.hookContext();
+    for (const row of rows) await (row as any)[hook](context);
   }
 
   /**

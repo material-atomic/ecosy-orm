@@ -16,6 +16,18 @@ import type { Queryable } from "./drivers/types";
  */
 export interface HookContext {
   db: Queryable;
+  /**
+   * Defers `fn` until the transaction the write is in commits; dropped if it
+   * rolls back. When the repository was bound with `using(tx)`, that is the
+   * caller's commit — not the end of this repository call. See
+   * `Transaction.afterCommit` for what it does and does not guarantee.
+   *
+   * @example
+   * afterUpdate({ afterCommit }) {
+   *   afterCommit(() => realtime.publish(`project:${this.id}`, "changed"));
+   * }
+   */
+  afterCommit(fn: () => unknown): void;
 }
 
 export type InferColumnType<T extends string> = 

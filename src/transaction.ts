@@ -1,6 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
 import type { DriverConnection, QueryResultLike } from "./drivers/types";
+import { currentLogger } from "./logger";
 
 type TransactionState = "open" | "committed" | "rolled back" | "released";
 
@@ -21,6 +22,7 @@ type TransactionState = "open" | "committed" | "rolled back" | "released";
  */
 export class Transaction implements DriverConnection {
   private state: TransactionState = "open";
+  private onCommit: (() => unknown)[] = [];
 
   constructor(private readonly client: DriverConnection) {}
 
@@ -43,11 +45,53 @@ export class Transaction implements DriverConnection {
     return this.client.query(sql, params);
   }
 
-  /** Commits, then returns the connection to the pool. */
+  /**
+   * Runs `fn` once this transaction has committed — and never, if it rolls
+   * back.
+   *
+   * For work that must not happen unless the data is really there: clearing a
+   * cache, pushing a realtime event, a best-effort email. Run inside the
+   * transaction instead, it would announce a write that a later statement can
+   * still roll back.
+   *
+   * Callbacks run in registration order, after the connection is back in the
+   * pool, and `commit()` — so `await DataSource.transaction(…)` — resolves
+   * only once they have finished: a cache cleared here is cleared before the
+   * response that follows is sent.
+   *
+   * A callback that throws is logged and does **not** reach the caller. The
+   * data is committed; an error there would read as a failed write, and a
+   * caller that retries would write twice.
+   *
+   * The guarantee is one-directional. It promises "not sent unless written",
+   * never "written, therefore sent": a process that dies between COMMIT and
+   * the callback loses it. Anything that must happen belongs in an outbox — a
+   * row written in this same transaction, which a worker sends and marks.
+   *
+   * @example
+   * await DataSource.transaction(async (tx) => {
+   *   const order = await orders.using(tx).insert({ … });
+   *   tx.afterCommit(() => cache.delete(`orders:${order.userId}`));
+   * });
+   *
+   * @throws If the transaction is no longer open — the moment to attach
+   * something to its commit has passed.
+   */
+  afterCommit(fn: () => unknown): void {
+    if (this.state !== "open") {
+      throw new Error(`[Transaction] Cannot register afterCommit: the transaction was ${this.state}.`);
+    }
+    this.onCommit.push(fn);
+  }
+
+  /** Commits, then returns the connection to the pool, then runs {@link afterCommit} callbacks. */
   async commit() {
     if (this.state !== "open") {
       throw new Error(`[Transaction] Cannot commit: the transaction was ${this.state}.`);
     }
+
+    const callbacks = this.onCommit;
+    this.onCommit = [];
 
     try {
       await this.client.query("COMMIT");
@@ -61,6 +105,14 @@ export class Transaction implements DriverConnection {
     } finally {
       this.client.release();
     }
+
+    for (const fn of callbacks) {
+      try {
+        await fn();
+      } catch (error) {
+        currentLogger().error("[Transaction] An afterCommit callback failed. The transaction is committed.", error);
+      }
+    }
   }
 
   /**
@@ -72,6 +124,7 @@ export class Transaction implements DriverConnection {
    */
   async rollback() {
     if (this.state !== "open") return;
+    this.onCommit = [];
 
     try {
       await this.client.query("ROLLBACK");
@@ -101,6 +154,7 @@ export class Transaction implements DriverConnection {
   }
 
   private async rollbackQuietly() {
+    this.onCommit = [];
     try {
       await this.client.query("ROLLBACK");
       this.state = "rolled back";
