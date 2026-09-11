@@ -42,7 +42,8 @@
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write src/",
     "format:check": "prettier --check src/",
-    "types:test": "tsc -p tsconfig.types-test.json"
+    "types:test": "tsc -p tsconfig.types-test.json",
+    "test:pg": "yarn build && node tests/pg/run.mjs"
   },
   "repository": {
     "type": "git",
