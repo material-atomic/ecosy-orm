@@ -275,4 +275,11 @@ export interface Driver extends Queryable {
 
   /** Takes one connection out of the pool, for a transaction to hold. */
   acquire(): Promise<DriverConnection>;
+
+  /**
+   * The most connections the pool will open. Sync holds several at once — a
+   * lock, and a transaction beside it — and a pool smaller than that does not
+   * fail, it waits for itself. Knowing the size lets sync refuse up front.
+   */
+  readonly maxConnections?: number;
 }

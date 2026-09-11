@@ -358,6 +358,8 @@ export function PgDriver(config: PgDriverConfig): Driver {
     name: "pg",
     dialect,
     sync,
+    /* pg's own default when `max` is not given. */
+    maxConnections: Number((poolConfig as PoolConfig).max ?? 10),
 
     async connect() {
       if (global[POOL]) return;

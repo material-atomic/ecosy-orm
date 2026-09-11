@@ -8,6 +8,8 @@ import { currentDialect, currentDriver } from "./drivers/current";
 import { DataSource } from "./data-source";
 import { Transaction } from "./transaction";
 import { withLock } from "./lock";
+/* Type only — erased at build. The class itself is imported on first sync. */
+import type { AsyncLocalStorage } from "node:async_hooks";
 
 
 /** Which rows an operation reaches on a soft-deleting entity. */
@@ -928,6 +930,44 @@ export class SchemaBuilder {
    * @param EntityClass The entity, when there is one, for its `effects`.
    */
   async syncSchema(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {
+    const hasEffects = Boolean((EntityClass as { effects?: unknown[] } | undefined)?.effects?.length);
+    const lockable = Boolean(this.dialect.advisoryLock && this.dialect.advisoryUnlock);
+
+    /* Held at once while an effect runs: sync's lock, the effects' lock, the
+       effect's transaction. Without effects: the lock, and a transaction for
+       the default probe beside it. A pool smaller than that does not error —
+       it waits for a connection only its own caller can free, forever. */
+    const needed = hasEffects ? 3 : 2;
+    const max = safeMaxConnections();
+    if (lockable && max !== undefined && max < needed) {
+      throw new Error(
+        `[DB] Syncing ${entityName} holds up to ${needed} connections at once — a lock, ` +
+          `${hasEffects ? "the effects' lock and an effect's transaction" : "and a transaction beside it"} — ` +
+          `and the pool allows ${max}. It would wait on itself and never finish. Raise \`max\` to ${needed} or more.`,
+      );
+    }
+
+    /* A sync that reaches its own entity again — an effect calling
+       syncSchema(), typically — would wait for the lock the outer sync holds,
+       which is released only when that effect returns. Caught by call chain,
+       not by a process-wide set: concurrent syncs of one entity, which the
+       lock serialises, are fine; only a sync nested inside itself is not. */
+    const chain = await syncChain();
+    const active = chain.getStore();
+    if (active?.has(entityName)) {
+      throw new Error(
+        `[DB] syncSchema("${entityName}") was called from inside the sync of ${entityName} — from ` +
+          `one of its effects, most likely. It would wait forever for the lock the outer sync ` +
+          `holds. An effect already runs mid-sync; do the work in it directly.`,
+      );
+    }
+    const nested = new Set(active ?? []);
+    nested.add(entityName);
+
+    return chain.run(nested, () => this.syncLocked(entityName, schema, EntityClass));
+  }
+
+  private syncLocked(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {
     /* One process at a time per table. Several replicas booting together
        otherwise interleave statement by statement — one drops what another is
        about to drop, or reads a constraint between the ADD and the COMMENT that
@@ -1473,4 +1513,25 @@ export class SchemaBuilder {
 function sameLiteral(rendered: string, declared: string): boolean {
   const match = /^('(?:[^']|'')*')::[a-z][\w\s."]*$/i.exec(rendered);
   return Boolean(match) && match![1] === declared;
+}
+
+function safeMaxConnections(): number | undefined {
+  try {
+    return currentDriver().maxConnections;
+  } catch {
+    return undefined;
+  }
+}
+
+/* Loaded on first sync, not at import: this module is on the root entry, and
+   a static node:async_hooks import would put a Node builtin in the graph of
+   everything that imports @ecosy/orm for a type. */
+let chainStorage: AsyncLocalStorage<Set<string>> | null = null;
+
+async function syncChain() {
+  if (!chainStorage) {
+    const hooks = await import("node:async_hooks");
+    chainStorage ??= new hooks.AsyncLocalStorage<Set<string>>();
+  }
+  return chainStorage;
 }

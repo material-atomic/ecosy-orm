@@ -49,13 +49,26 @@ for (const file of files) {
   console.log(`\n━━ ${file}`);
   const run = spawnSync(process.execPath, [`${dir}${file}`], {
     env: { ...process.env, TEST_DATABASE_URL: target.toString() },
-    stdio: "inherit",
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
   });
-  results.push({ file, ok: run.status === 0 });
+  process.stdout.write(run.stdout ?? "");
+  process.stderr.write(run.stderr ?? "");
+  /* Counted here, from what each file printed, so the total in a report is
+     the runner's number rather than one added up by hand afterwards. */
+  const tally = /(\d+) passed, (\d+) failed/.exec(run.stdout ?? "");
+  results.push({
+    file,
+    ok: run.status === 0,
+    passed: tally ? Number(tally[1]) : 0,
+    failed: tally ? Number(tally[2]) : 0,
+  });
 }
 
 console.log("\n━━ summary");
-for (const r of results) console.log(`  ${r.ok ? "✓" : "✗"} ${r.file}`);
+for (const r of results) console.log(`  ${r.ok ? "✓" : "✗"} ${r.file.padEnd(28)} ${String(r.passed).padStart(4)} passed${r.failed ? `, ${r.failed} failed` : ""}`);
 const failedFiles = results.filter((r) => !r.ok).length;
-console.log(`\n${results.length - failedFiles} of ${results.length} files passed`);
+const total = results.reduce((n, r) => n + r.passed, 0);
+const totalFailed = results.reduce((n, r) => n + r.failed, 0);
+console.log(`\n${results.length - failedFiles} of ${results.length} files passed · ${total} checks passed, ${totalFailed} failed`);
 process.exit(failedFiles ? 1 : 0);
