@@ -6,7 +6,11 @@ import type { Entity as BaseEntity } from "./entity";
 import type { ColumnInfo, Dialect, Queryable, SyncOptions } from "./drivers/types";
 import { currentDialect, currentDriver } from "./drivers/current";
 import { DataSource } from "./data-source";
+import { Transaction } from "./transaction";
 
+
+/** Which rows an operation reaches on a soft-deleting entity. */
+export type Scope = "live" | "deleted" | "all";
 
 export class QueryBuilder<Entity extends BaseEntity> {
   constructor(
@@ -75,6 +79,79 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return this.dialect.supportsReturning;
   }
 
+  /**
+   * Which rows an operation may touch, for an entity with `softDelete`.
+   *
+   * One rule for every operation: live rows, unless `withDeleted` or
+   * `onlyDeleted` says otherwise out loud. And a WHERE that names the
+   * soft-delete column while the scope is still "live" is refused rather than
+   * run. It can only ever match nothing — `deleted_at BETWEEN …` ANDed with
+   * `deleted_at IS NULL` — and a purge that silently deletes nothing is a
+   * purge nobody notices is not running.
+   */
+  resolveScope(
+    where: FindWhereOptions<Entity> | undefined,
+    options: { withDeleted?: boolean | undefined; onlyDeleted?: boolean | undefined } = {},
+  ): Scope {
+    const key = this.schema.softDelete;
+
+    if (options.withDeleted && options.onlyDeleted) {
+      throw new Error(`[QueryBuilder] ${this.entityName}: withDeleted and onlyDeleted together mean nothing. Pick one.`);
+    }
+    if (!key) {
+      if (options.withDeleted || options.onlyDeleted) {
+        throw new Error(`[QueryBuilder] ${this.entityName} has no softDelete column, so there are no deleted rows to include.`);
+      }
+      return "all";
+    }
+
+    const scope: Scope = options.onlyDeleted ? "deleted" : options.withDeleted ? "all" : "live";
+    if (scope === "live" && where && this.mentions(where, key)) {
+      throw new Error(
+        `[QueryBuilder] ${this.entityName}: the condition names "${key}", but only live rows are ` +
+          `in scope — on those it is always NULL, so this would match nothing. Pass ` +
+          `onlyDeleted: true (or withDeleted: true) to reach soft-deleted rows.`,
+      );
+    }
+    return scope;
+  }
+
+  private mentions(where: FindWhereOptions<Entity>, key: string): boolean {
+    if (Array.isArray(where)) return where.some((w) => this.mentions(w, key));
+    const w = where as any;
+    if (w && (w.type === "AND" || w.type === "OR") && Array.isArray(w.conditions)) {
+      return w.conditions.some((c: FindWhereOptions<Entity>) => this.mentions(c, key));
+    }
+    return Boolean(w) && typeof w === "object" && key in w && w[key] !== undefined;
+  }
+
+  /**
+   * The WHERE body for a condition plus a scope. The condition is wrapped: an
+   * array condition builds an OR, and `a OR b AND deleted_at IS NULL` binds as
+   * `a OR (b AND …)` — a deleted row matching `a` walks straight through.
+   */
+  /** Column sets of every live-only unique: column-level and index-level. */
+  private liveUniques(): string[][] {
+    const out: string[][] = [];
+    for (const [key, opt] of Object.entries(this.schema.columns)) {
+      if (opt.unique === "live") out.push([key]);
+    }
+    for (const idx of this.schema.indexes ?? []) {
+      if (idx.unique === "live") out.push([...idx.columns]);
+    }
+    return out;
+  }
+
+  private scoped(where: FindWhereOptions<Entity> | undefined, params: any[], scope: Scope): string {
+    const condition = this.buildWhereSql(where ?? ({} as any), params);
+    const key = this.schema.softDelete;
+    const filter = !key || scope === "all"
+      ? ""
+      : `${this.withEntity(key)} IS ${scope === "live" ? "" : "NOT "}NULL`;
+    if (condition && filter) return `(${condition}) AND ${filter}`;
+    return condition || filter;
+  }
+
   private buildWhereSql(where: FindWhereOptions<Entity>, params: any[]): string {
     if (Array.isArray(where)) {
       const conditions = where.map((w: FindWhereOptions<Entity>) => this.buildWhereSql(w, params)).filter(Boolean);
@@ -131,7 +208,7 @@ export class QueryBuilder<Entity extends BaseEntity> {
   buildSelect(options: FindOptions<Entity>): { sql: string, params: any[] } {
     const params: any[] = [];
     const result: string[] = [];
-    const where = this.buildWhereSql(options.where ?? ({} as any), params);
+    const where = this.scoped(options.where, params, this.resolveScope(options.where, options));
     
     if (where) {
       result.push(`WHERE ${where}`);
@@ -222,6 +299,7 @@ export class QueryBuilder<Entity extends BaseEntity> {
     where: FindWhereOptions<Entity>,
     data: PartialInput<Entity>,
     returning = false,
+    scope: Scope = "live",
   ): { sql: string, params: any[] } {
     const params: any[] = [];
     const given = Object.entries(data).filter(
@@ -237,7 +315,7 @@ export class QueryBuilder<Entity extends BaseEntity> {
         params.push(this.encode(tsKey, v));
         return `${this.q(this.dbCol(tsKey))} = ${this.dialect.placeholder(params.length)}`;
       }).join(", ");
-    const condition = this.buildWhereSql(where, params);
+    const condition = this.scoped(where, params, scope);
     
     const sql = [
       `UPDATE ${this.entityName} SET ${assignments}`,
@@ -247,9 +325,40 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return { sql, params };
   }
 
-  buildDelete(where: FindWhereOptions<Entity>, returning = false): { sql: string, params: any[] } {
+  /**
+   * Soft delete: stamps the column on live rows.
+   *
+   * The stamp is the transaction's start time, truncated to milliseconds, and
+   * both halves are load-bearing. Transaction start: a parent and the children
+   * its afterRemove soft-deletes share one value, which is what lets a restore
+   * bring back exactly the children that went with it and not one deleted the
+   * day before. Milliseconds: the driver hands timestamps to JavaScript as a
+   * Date, which holds milliseconds; a microsecond stamp read back and passed
+   * to `restore({ deletedAt })` would never equal itself.
+   */
+  buildSoftDelete(where: FindWhereOptions<Entity>, returning = false): { sql: string, params: any[] } {
+    const key = this.schema.softDelete!;
     const params: any[] = [];
-    const condition = this.buildWhereSql(where, params);
+    const condition = this.scoped(where, params, "live");
+    const stamp = this.dialect.softDeleteStamp ?? "CURRENT_TIMESTAMP";
+    const sql = `UPDATE ${this.entityName} SET ${this.q(this.dbCol(key))} = ${stamp}` +
+      (condition ? ` WHERE ${condition}` : "") + (returning ? this.returning() : "");
+    return { sql, params };
+  }
+
+  /** Restore: clears the column on soft-deleted rows. */
+  buildRestore(where: FindWhereOptions<Entity>, returning = false): { sql: string, params: any[] } {
+    const key = this.schema.softDelete!;
+    const params: any[] = [];
+    const condition = this.scoped(where, params, "deleted");
+    const sql = `UPDATE ${this.entityName} SET ${this.q(this.dbCol(key))} = NULL` +
+      (condition ? ` WHERE ${condition}` : "") + (returning ? this.returning() : "");
+    return { sql, params };
+  }
+
+  buildDelete(where: FindWhereOptions<Entity>, returning = false, scope: Scope = "live"): { sql: string, params: any[] } {
+    const params: any[] = [];
+    const condition = this.scoped(where, params, scope);
     
     const sql = [
       `DELETE FROM ${this.entityName}`,
@@ -308,7 +417,16 @@ export class QueryBuilder<Entity extends BaseEntity> {
       .filter(c => !conflictColumns.includes(c))
       .map(c => this.dbCol(c));
 
-    const sql = `${insertSql} ${this.dialect.upsertClause(dbConflictColumns, updateColumns)}${this.returning()}`;
+    /* A conflict target that is a live-only unique index has to be named with
+       its predicate, or Postgres finds no arbiter index to match it against. */
+    const live = this.liveUniques().find(
+      (cols) => cols.length === conflictColumns.length && cols.every((c) => conflictColumns.includes(c)),
+    );
+    const predicate = live
+      ? `${this.q(this.dbCol(this.schema.softDelete!))} IS NULL`
+      : undefined;
+
+    const sql = `${insertSql} ${this.dialect.upsertClause(dbConflictColumns, updateColumns, predicate)}${this.returning()}`;
     
     return { sql, params };
   }
@@ -345,7 +463,8 @@ export class SchemaBuilder {
   private columnDefinition(opt: any, withPrimaryKey: boolean, withNotNull = true) {
     let def = `${this.dialect.quote(opt.name)} ${opt.type}`;
     if (withPrimaryKey && opt.primaryKey) def += " PRIMARY KEY";
-    if (opt.unique) def += " UNIQUE";
+    /* `"live"` is a partial index, built with the other indexes. */
+    if (opt.unique === true) def += " UNIQUE";
     if (opt.notNull && withNotNull) def += " NOT NULL";
     if (opt.default) def += ` DEFAULT ${opt.default}`;
     if (opt.references) def += ` REFERENCES ${opt.references}`;
@@ -381,7 +500,50 @@ export class SchemaBuilder {
     const cols = idx.columns
       .map((c: string) => this.dialect.quote(schema.columns[c]?.name || c))
       .join(", ");
-    return `CREATE ${unique}INDEX ${this.dialect.quote(idx.name)} ON ${this.dialect.quote(entityName)} (${cols})`;
+    const where = idx.unique === "live" ? ` WHERE ${this.livePredicate(schema)}` : "";
+    return `CREATE ${unique}INDEX ${this.dialect.quote(idx.name)} ON ${this.dialect.quote(entityName)} (${cols})${where}`;
+  }
+
+  private livePredicate(schema: SchemaOptions) {
+    const col = schema.columns[schema.softDelete!];
+    return `${this.dialect.quote(String(col?.name ?? schema.softDelete))} IS NULL`;
+  }
+
+  /**
+   * The declared indexes plus one per column declared `unique: "live"`.
+   *
+   * A column-level live unique is a partial index, so it has to be counted as
+   * declared — otherwise the pass that drops undeclared indexes would remove it
+   * on the next boot, and the column would quietly stop being unique at all.
+   */
+  private effectiveIndexes(entityName: string, schema: SchemaOptions): any[] {
+    const synthesized = Object.entries(schema.columns)
+      .filter(([, opt]) => opt.unique === "live")
+      .map(([key, opt]) => ({ name: `${entityName}_${opt.name ?? key}_live_key`, columns: [key], unique: "live" }));
+    return [...(schema.indexes ?? []), ...synthesized];
+  }
+
+  /**
+   * Refuses, by name and example, to build a unique index over data that
+   * already breaks it. Left to the engine it is "could not create unique
+   * index", once, for the first pair it trips on.
+   */
+  private async assertUnique(entityName: string, schema: SchemaOptions, keys: readonly string[], live: boolean) {
+    const cols = keys.map((k) => this.dialect.quote(String(schema.columns[k]?.name ?? k)));
+    const filters = cols.map((c) => `${c} IS NOT NULL`);
+    if (live) filters.push(this.livePredicate(schema));
+    const dupes = await this.connection.query(
+      `SELECT ${cols.join(", ")}, count(*) AS n FROM ${this.dialect.quote(entityName)} ` +
+        `WHERE ${filters.join(" AND ")} GROUP BY ${cols.join(", ")} HAVING count(*) > 1 LIMIT 3`,
+    );
+    if (dupes.rows.length) {
+      const sample = dupes.rows.map((r: any) => keys.map((k) => JSON.stringify(r[String(schema.columns[k]?.name ?? k)])).join("/")).join(", ");
+      throw new Error(
+        `[DB] ${entityName} (${keys.join(", ")}) is declared unique${live ? ' among live rows' : ""}, but ` +
+          `existing rows repeat values — for example ${sample}. Resolve them from an effect, which ` +
+          `runs before unique constraints are applied.`,
+      );
+    }
   }
 
   private checkStatement(entityName: string, chk: any, validate = true) {
@@ -518,16 +680,35 @@ export class SchemaBuilder {
       }
 
       if (current === null) toSet.push({ dbCol, expression: declared });
-      else if (current !== declared) toCompare.push({ dbCol, opt, current, declared });
+      else if (current !== declared && !sameLiteral(current, declared)) {
+        toCompare.push({ dbCol, opt, current, declared });
+      }
     }
 
     if (toCompare.length && this.dialect.renderDefaults) {
       const render = this.dialect.renderDefaults.bind(this.dialect);
-      const rendered = await DataSource.transaction((tx) =>
-        render(tx, toCompare.map((c) => ({ type: String(c.opt.type), expression: c.declared }))),
-      );
-      toCompare.forEach((c, i) => {
-        if (rendered[i] !== c.current) toSet.push({ dbCol: c.dbCol, expression: c.declared });
+      const defs = toCompare.map((c) => ({ type: String(c.opt.type), expression: c.declared }));
+      let rendered: string[] | null = null;
+
+      try {
+        /* The probe needs one session for its temporary table. A transaction
+           is one, so the builder's own connection is used when it is one; the
+           pool is not, so a transaction is borrowed from it otherwise. */
+        rendered = this.connection instanceof Transaction
+          ? await render(this.connection, defs)
+          : await DataSource.transaction((tx) => render(tx, defs));
+      } catch (error: any) {
+        /* 42501: no TEMP privilege. Refusing to boot over a comparison is out
+           of proportion — the defaults are left as they are, and said so. */
+        if (error?.code !== "42501") throw error;
+        currentLogger().warn(
+          `[DB] Cannot compare the defaults of ${entityName} (${toCompare.map((c) => c.dbCol).join(", ")}): ` +
+            `the database refuses temporary tables to this role. They are left as they are.`,
+        );
+      }
+
+      rendered?.forEach((text, i) => {
+        if (text !== toCompare[i]!.current) toSet.push({ dbCol: toCompare[i]!.dbCol, expression: toCompare[i]!.declared });
       });
     }
 
@@ -562,9 +743,10 @@ export class SchemaBuilder {
         if (error?.code !== "23505" || attempt >= attempts) {
           if (error?.code === "23505") {
             throw new Error(
-              `[DB] Filling ${entityName}.${dbCol} from its default collided with an existing ` +
-                `value ${attempts} times running. Its default cannot produce enough distinct ` +
-                `values for a unique column — widen it, or fill these rows from an effect.`,
+              `[DB] Filling ${entityName}.${dbCol} from its default hit a duplicate ${attempts} times ` +
+                `running — against a stored row, or between two values drawn in the same fill. ` +
+                `Its default cannot produce enough distinct values for a unique column: widen it, ` +
+                `or fill these rows from an effect.`,
               { cause: error },
             );
           }
@@ -600,20 +782,20 @@ export class SchemaBuilder {
 
     for (const opt of Object.values(schema.columns) as any[]) {
       const ref = String(opt.references ?? "");
-      if (!ref) continue;
+      if (!ref || opt.acknowledgeHookBypass) continue;
 
       if (removeHooks.length && /ON\s+DELETE\s+CASCADE/i.test(ref)) {
         currentLogger().warn(
           `[DB] ${entityName} declares ${removeHooks.join(" and ")}, but ${entityName}.${opt.name} ` +
             `references ${ref}: rows removed by that cascade are deleted by the database, and no ` +
-            `hook sees them.`,
+            `hook sees them. If that is intended, say so with acknowledgeHookBypass: true on the column.`,
         );
       }
       if (updateHooks.length && /ON\s+(DELETE\s+SET\s+(NULL|DEFAULT)|UPDATE\s+(CASCADE|SET\s+(NULL|DEFAULT)))/i.test(ref)) {
         currentLogger().warn(
           `[DB] ${entityName} declares ${updateHooks.join(" and ")}, but ${entityName}.${opt.name} ` +
             `references ${ref}: rows that action changes are changed by the database, and no ` +
-            `hook sees them.`,
+            `hook sees them. If that is intended, say so with acknowledgeHookBypass: true on the column.`,
         );
       }
     }
@@ -651,7 +833,7 @@ export class SchemaBuilder {
 
       await this.connection.query(`CREATE TABLE ${table} (\n  ${columnsSql}\n)`);
 
-      for (const idx of schema.indexes || []) {
+      for (const idx of this.effectiveIndexes(entityName, schema)) {
         await this.connection.query(this.indexStatement(entityName, schema, idx));
       }
 
@@ -906,12 +1088,45 @@ export class SchemaBuilder {
       }
     }
 
-    const existingIndexes = await this.dialect.listIndexes(this.connection, entityName);
+    /* Column-level `unique: true` is a constraint. Reconciled here, after the
+       effects — adding one is a tightening, and an effect is where duplicates
+       get resolved first. Before 1.2.0 a change to `unique` on an existing
+       column was not reconciled at all: declared, and not enforced. */
+    const uniqueConstraints = this.dialect.listUniqueConstraints
+      ? await this.dialect.listUniqueConstraints(this.connection, entityName)
+      : null;
 
-    for (const idx of schema.indexes || []) {
+    if (uniqueConstraints && this.dialect.addUnique) {
+      for (const [key, opt] of Object.entries(schema.columns) as [string, any][]) {
+        if (opt.primaryKey) continue;
+        const dbCol = String(opt.name);
+        const existing = uniqueConstraints[dbCol];
+
+        if (opt.unique === true && !existing) {
+          await this.assertUnique(entityName, schema, [key], false);
+          currentLogger().info(`[DB] Adding a unique constraint on ${entityName}.${dbCol}.`);
+          await this.connection.query(this.dialect.addUnique(entityName, `${entityName}_${dbCol}_key`, dbCol));
+        } else if (opt.unique !== true && existing) {
+          currentLogger().warn(
+            `[DB] Dropping the unique constraint on ${entityName}.${dbCol} — the entity ` +
+              `${opt.unique === "live" ? 'now declares it unique: "live"' : "no longer declares it unique"}.`,
+          );
+          await this.connection.query(this.dialect.dropForeignKey(entityName, existing));
+        }
+      }
+    }
+
+    const existingIndexes = await this.dialect.listIndexes(this.connection, entityName);
+    const indexes = this.effectiveIndexes(entityName, schema);
+    /* Postgres renders the predicate back as `WHERE (deleted_at IS NULL)`. */
+    const flat = (text: string) => text.replace(/["\s()]/g, "").toLowerCase();
+
+    for (const idx of indexes) {
       const create = this.indexStatement(entityName, schema, idx);
+      const live = idx.unique === "live";
 
       if (!existingIndexes[idx.name]) {
+        if (idx.unique) await this.assertUnique(entityName, schema, idx.columns, live);
         await this.connection.query(create);
         continue;
       }
@@ -920,10 +1135,16 @@ export class SchemaBuilder {
       const mappedCols = idx.columns.map((c: string) => schema.columns[c]?.name || c);
       const colsMatch = mappedCols.every((c: string) => currentDef.includes(c));
       const uniqueMatch = idx.unique ? currentDef.includes("UNIQUE") : !currentDef.includes("UNIQUE");
+      /* Compared both ways: an index that should be partial and is not, and
+         one that is partial and should not be, are both a different index. */
+      const predicateMatch = live
+        ? flat(currentDef).endsWith(`where${flat(this.livePredicate(schema))}`)
+        : !/\sWHERE\s/i.test(currentDef);
 
-      if (!colsMatch || !uniqueMatch) {
+      if (!colsMatch || !uniqueMatch || !predicateMatch) {
         currentLogger().warn(`[DB] Recreating index ${idx.name} on ${entityName}.`);
         await this.connection.query(`DROP INDEX ${this.dialect.quote(idx.name)}`);
+        if (idx.unique) await this.assertUnique(entityName, schema, idx.columns, live);
         await this.connection.query(create);
       }
     }
@@ -931,7 +1152,7 @@ export class SchemaBuilder {
     /* Indexes the entity no longer declares. Only ones that exist in their own
        right: an index backing a primary key or a unique constraint belongs to
        that constraint and goes when it does. */
-    const declaredIndexes = new Set((schema.indexes || []).map((i: any) => i.name));
+    const declaredIndexes = new Set(indexes.map((i: any) => i.name));
 
     for (const name of await this.dialect.listOwnedIndexes(this.connection, entityName)) {
       if (declaredIndexes.has(name)) continue;
@@ -1106,4 +1327,15 @@ export class SchemaBuilder {
 
     return !(ALIASES[want] ?? []).some((alias) => have.includes(alias));
   }
+}
+
+/**
+ * `'html'::text` against a declared `'html'`: the engine added a cast of the
+ * column's own type to a quoted literal. Recognised without a round trip —
+ * nearly every literal default renders this way, and the probe that settles
+ * the other cases needs a temporary table.
+ */
+function sameLiteral(rendered: string, declared: string): boolean {
+  const match = /^('(?:[^']|'')*')::[a-z][\w\s."]*$/i.exec(rendered);
+  return Boolean(match) && match![1] === declared;
 }

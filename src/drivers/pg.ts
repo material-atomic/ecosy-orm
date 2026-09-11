@@ -27,7 +27,9 @@ const dialect: Dialect = {
   advisoryLock: (key) => `SELECT pg_advisory_lock(hashtext('${key.replace(/'/g, "''")}'))`,
   advisoryUnlock: (key) => `SELECT pg_advisory_unlock(hashtext('${key.replace(/'/g, "''")}'))`,
 
-  upsertClause: (conflictColumns, updateColumns) => {
+  softDeleteStamp: "date_trunc('milliseconds', now())",
+
+  upsertClause: (conflictColumns, updateColumns, predicate) => {
     const target = conflictColumns.map((c) => dialect.quote(c)).join(", ");
 
     /* Every inserted column is a conflict column, so there is nothing left to
@@ -45,7 +47,7 @@ const dialect: Dialect = {
       ? updateColumns.map((c) => `${dialect.quote(c)} = EXCLUDED.${dialect.quote(c)}`).join(", ")
       : `${dialect.quote(conflictColumns[0]!)} = EXCLUDED.${dialect.quote(conflictColumns[0]!)}`;
 
-    return `ON CONFLICT (${target}) DO UPDATE SET ${assignments}`;
+    return `ON CONFLICT (${target})${predicate ? ` WHERE ${predicate}` : ""} DO UPDATE SET ${assignments}`;
   },
 
   alterNullable: (table, column, _type, notNull) =>
@@ -66,20 +68,27 @@ const dialect: Dialect = {
      outliving the transaction the caller holds it in. */
   async renderDefaults(db, defaults) {
     if (!defaults.length) return [];
-    const probe = "_ecosy_default_probe";
+    /* Named per call and dropped straight after: the caller's transaction may
+       sync several entities, and ON COMMIT DROP alone would leave the first
+       probe in the way of the second. */
+    const probe = `_ecosy_default_probe_${Math.random().toString(36).slice(2, 10)}`;
     await db.query(
       `CREATE TEMP TABLE ${probe} (` +
         defaults.map((d, i) => `c${i} ${d.type} DEFAULT ${d.expression}`).join(", ") +
         `) ON COMMIT DROP`,
     );
-    const result = await db.query(
-      `SELECT pg_get_expr(d.adbin, d.adrelid) AS expr
-         FROM pg_attrdef d
-         JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-        WHERE d.adrelid = 'pg_temp.${probe}'::regclass
-        ORDER BY a.attnum`,
-    );
-    return result.rows.map((row: any) => String(row.expr));
+    try {
+      const result = await db.query(
+        `SELECT pg_get_expr(d.adbin, d.adrelid) AS expr
+           FROM pg_attrdef d
+           JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+          WHERE d.adrelid = 'pg_temp.${probe}'::regclass
+          ORDER BY a.attnum`,
+      );
+      return result.rows.map((row: any) => String(row.expr));
+    } finally {
+      await db.query(`DROP TABLE IF EXISTS pg_temp.${probe}`);
+    }
   },
 
   /**
@@ -167,6 +176,23 @@ const dialect: Dialect = {
 
   dropForeignKey: (table, name) =>
     `ALTER TABLE ${dialect.quote(table)} DROP CONSTRAINT ${dialect.quote(name)}`,
+
+  /* Single-column UNIQUE constraints only: that is what `unique: true` on a
+     column creates. A multi-column one came from somewhere else, and is not
+     this reconciliation's to touch. */
+  async listUniqueConstraints(db, table) {
+    const result = await db.query(
+      `SELECT c.conname, a.attname
+         FROM pg_constraint c
+         JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+        WHERE c.conrelid = $1::regclass AND c.contype = 'u' AND array_length(c.conkey, 1) = 1`,
+      [table],
+    );
+    return Object.fromEntries(result.rows.map((row: any) => [row.attname, row.conname]));
+  },
+
+  addUnique: (table, name, column) =>
+    `ALTER TABLE ${dialect.quote(table)} ADD CONSTRAINT ${dialect.quote(name)} UNIQUE (${dialect.quote(column)})`,
 
   async listOwnedIndexes(db, table): Promise<string[]> {
     const result = await db.query(

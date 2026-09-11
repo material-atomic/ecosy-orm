@@ -100,7 +100,15 @@ export interface Dialect {
    * mapped to their database names.
    * @param updateColumns Columns to overwrite, already mapped.
    */
-  upsertClause(conflictColumns: string[], updateColumns: string[]): string;
+  /** `predicate` names a partial unique index as the arbiter: `ON CONFLICT (cols) WHERE predicate`. */
+  upsertClause(conflictColumns: string[], updateColumns: string[], predicate?: string): string;
+
+  /**
+   * What a soft delete writes into the column. Default `CURRENT_TIMESTAMP`.
+   * It should be the transaction's start time, so one delete and the deletes
+   * its hooks make share a value, at a precision the driver returns intact.
+   */
+  softDeleteStamp?: string;
 
   /** `SET NOT NULL` versus `MODIFY COLUMN`. */
   alterNullable(table: string, column: string, type: string, notNull: boolean): string;
@@ -199,6 +207,10 @@ export interface Dialect {
 
   /** `ALTER TABLE ... DROP CONSTRAINT`. */
   dropForeignKey(table: string, name: string): string;
+
+  /** Column name to the name of the single-column UNIQUE constraint on it. */
+  listUniqueConstraints?(db: Queryable, table: string): Promise<Record<string, string>>;
+  addUnique?(table: string, name: string, column: string): string;
   /** Drops a column, with whatever it held. */
   dropColumn(table: string, column: string): string;
   /** Renames a column, keeping what it holds. */

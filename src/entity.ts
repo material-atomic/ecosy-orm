@@ -28,6 +28,13 @@ export interface HookContext {
    * }
    */
   afterCommit(fn: () => unknown): void;
+  /**
+   * Set for `beforeRemove` and `afterRemove`: true when the row is being
+   * soft-deleted, false when it is being deleted for real. The same hooks
+   * see both — an audit written for afterRemove that missed every soft delete
+   * would miss nearly all of them.
+   */
+  soft?: boolean;
 }
 
 export type InferColumnType<T extends string> = 
@@ -43,10 +50,20 @@ export type InferSchema<TCols extends Record<string, ColumnOptions>> = {
     : InferColumnType<TCols[K]["type"]> | null;
 };
 
+/**
+ * Keys of columns that can hold a soft-delete timestamp: a TIMESTAMP or
+ * TIMESTAMPTZ that is allowed to be NULL, because NULL is what "live" means.
+ */
+export type SoftDeleteKey<TCols extends Record<string, ColumnOptions>> = {
+  [K in keyof TCols]: TCols[K]["type"] extends "TIMESTAMPTZ" | "TIMESTAMP"
+    ? TCols[K]["notNull"] extends true ? never : K
+    : never;
+}[keyof TCols] & string;
+
 export type EntityConstructor<T extends Entity = Entity> = {
   new (): T;
   readonly entityName: string;
-  readonly schema: { columns: Record<string, ColumnOptions>; indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[] };
+  readonly schema: { columns: Record<string, ColumnOptions>; indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[]; softDelete?: string };
   hydrate: typeof Entity.hydrate;
   /** Declared as a static on a subclass. See {@link EntityEffect}. */
   readonly effects?: readonly EntityEffect<any>[];
@@ -162,6 +179,16 @@ export abstract class Entity {
   afterRemove?(context: HookContext): void | Promise<void>;
 
   /**
+   * Before a soft-deleted row is restored, once per row, with `this` as the
+   * row still deleted. Throwing stops the restore. Reads and locks the rows
+   * first, as `beforeRemove` does.
+   */
+  beforeRestore?(context: HookContext): void | Promise<void>;
+
+  /** After a row is restored, with `this` as the row now live again. Throwing rolls it back. */
+  afterRestore?(context: HookContext): void | Promise<void>;
+
+  /**
    * On every row read back — `find`, `findOne`, and the rows a write returns.
    * Synchronous on purpose: it runs once per row of every query, and an await
    * there is paid ten thousand times on a large page. Prefer a getter for
@@ -216,7 +243,44 @@ export abstract class Entity {
   static create<
     TName extends string, 
     TCols extends Record<string, ColumnOptions>
-  >(entityName: TName, schema: { columns: TCols, indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[] }) {
+  >(entityName: TName, schema: {
+    columns: TCols;
+    indexes?: readonly IndexOptions[];
+    checks?: readonly CheckOptions[];
+    /**
+     * Soft delete, pointing at a column the entity declares — never one the
+     * ORM adds out of sight, so it is in the declaration and in the type.
+     *
+     * With it on, the ORM runs the lifecycle and every repository call obeys
+     * it without being told:
+     * - `find` / `findOne` see live rows only; `withDeleted` / `onlyDeleted`
+     *   say otherwise, out loud.
+     * - `update(where)` touches live rows only.
+     * - `delete(where)` sets the column to now. `{ hard: true }` deletes.
+     * - `restore(where)` sets it back to NULL.
+     * - beforeRemove / afterRemove run for both kinds of delete, with
+     *   `soft` in the context; beforeRestore / afterRestore for restores.
+     *
+     * The column is written only through delete and restore — `update()`
+     * refuses a patch that sets it, since that would soft-delete or restore
+     * past the hooks.
+     *
+     * Where it does not reach:
+     * - Hand-written SQL. `connection.query` is not built here, so nothing
+     *   filters it.
+     * - Foreign keys. `ON DELETE CASCADE` fires on a real DELETE only; a
+     *   soft-deleted parent leaves its children live. Soft-delete them from
+     *   `afterRemove` when `soft` is true, or leave them until the parent is
+     *   purged and the cascade runs.
+     * - Purging. Soft-deleted rows stay until something deletes them:
+     *   `delete(where, { hard: true, onlyDeleted: true })` from a schedule.
+     *
+     * @example
+     * columns: { …, deletedAt: { type: "TIMESTAMPTZ", name: "deleted_at" } },
+     * softDelete: "deletedAt",
+     */
+    softDelete?: SoftDeleteKey<TCols>;
+  }) {
     
     /* A column with no `name` is named after its key. Done once here so every
        reader of the schema sees a name, rather than each one falling back. */
@@ -244,6 +308,26 @@ export abstract class Entity {
        The shape that works: a surrogate key column, plus a unique index over
        the columns that used to be the key. `upsert(data, conflictColumns)`
        needs only the unique index, so ON CONFLICT is unaffected. */
+    /* The type narrows `softDelete` to a nullable timestamp column, but only
+       for a schema declared `as const`; this holds for every other caller. */
+    if (schema.softDelete !== undefined) {
+      const col = (schema.columns as Record<string, ColumnOptions>)[schema.softDelete];
+      if (!col || !/^TIMESTAMP(TZ)?$/i.test(String(col.type)) || col.notNull) {
+        throw new Error(
+          `[Entity] "${entityName}" sets softDelete: "${schema.softDelete}", which must name a ` +
+            `declared TIMESTAMP or TIMESTAMPTZ column that allows NULL — NULL is what a live row holds.`,
+        );
+      }
+    }
+    for (const [key, opt] of Object.entries(schema.columns)) {
+      if (opt.unique === "live" && schema.softDelete === undefined) {
+        throw new Error(
+          `[Entity] "${entityName}.${key}" is unique: "live", which means unique among rows that ` +
+            `are not soft-deleted — and "${entityName}" has no softDelete column to tell them apart.`,
+        );
+      }
+    }
+
     const primaryKeys = Object.entries(schema.columns).filter(([, opt]) => opt.primaryKey);
 
     if (primaryKeys.length > 1) {
@@ -271,7 +355,7 @@ export abstract class Entity {
     return GeneratedEntity as unknown as {
       new (): GeneratedEntity & InferSchema<TCols>;
       readonly entityName: TName;
-      readonly schema: { columns: TCols, indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[] };
+      readonly schema: { columns: TCols, indexes?: readonly IndexOptions[]; checks?: readonly CheckOptions[]; softDelete?: string };
       hydrate: typeof Entity.hydrate;
     };
   }
@@ -298,6 +382,10 @@ export abstract class Entity {
          rejected update on a generated key at worst. */
       const updateData: Record<string, unknown> = { ...(this as unknown as Record<string, unknown>) };
       delete updateData[pkField];
+      /* The soft-delete column is carried by every loaded row and written by
+         delete() and restore() alone. Saving it back would be a restore — or
+         a delete — that no hook saw. */
+      if (repo.schema.softDelete) delete updateData[repo.schema.softDelete];
       
       /* Read back, so this instance goes on describing the row: whatever
          beforeUpdate assigned went to a copy, and would otherwise be written
@@ -305,7 +393,9 @@ export abstract class Entity {
       const { rows } = await repo.update(
         { [pkField]: pkValue } as FindWhereOptions<this>,
         updateData as PartialInput<this>,
-        { returning: true },
+        /* Addressed by primary key to the one row this instance is, so there
+           is nothing for the live-rows filter to protect. */
+        { returning: true, withDeleted: Boolean(repo.schema.softDelete) || undefined },
       );
       if (rows[0]) Object.assign(this, rows[0]);
       return this;
@@ -316,8 +406,8 @@ export abstract class Entity {
     }
   }
 
-  /** Removes this row. */
-  async delete(): Promise<void> {
+  /** Removes this row — soft-deleting it, on an entity with `softDelete`, unless `hard` is set. */
+  async delete(options: { hard?: boolean | undefined } = {}): Promise<void> {
     const repo = this._repository;
     if (!repo) {
       throw new Error("Cannot delete() a disconnected Entity.");
@@ -330,7 +420,18 @@ export abstract class Entity {
       throw new Error("Cannot delete() an Entity that does not have a primary key value.");
     }
 
-    await repo.delete({ [pkField]: pkValue } as FindWhereOptions<this>);
+    await repo.delete({ [pkField]: pkValue } as FindWhereOptions<this>, options);
+  }
+
+  /** Brings this soft-deleted row back, and this instance with it. */
+  async restore(): Promise<this> {
+    const repo = this._repository;
+    if (!repo) throw new Error("Cannot restore() a disconnected Entity.");
+
+    const pkField = repo.getPrimaryKeyField();
+    const { rows } = await repo.restore({ [pkField]: (this as Record<string, unknown>)[pkField] } as FindWhereOptions<this>);
+    if (rows[0]) Object.assign(this, rows[0]);
+    return this;
   }
 
   /**

@@ -39,16 +39,21 @@ export interface EffectContext<T extends Entity = Entity> {
  * stops with the effect's name in the error, instead of a constraint failing
  * later with only the column's.
  *
+ * For filling NULL rows before `NOT NULL`, a `default` on the column is the
+ * shorter road — sync fills from it, retrying on a unique collision. An effect
+ * is for what a default cannot say: data moving between columns, values
+ * computed from other rows.
+ *
  * @example
- * export class ProjectEntity extends Entity.create("projects", configs) {
- *   static effects: EntityEffect<ProjectEntity>[] = [
+ * export class PersonEntity extends Entity.create("people", configs) {
+ *   static effects: EntityEffect<PersonEntity>[] = [
  *     {
- *       name: "backfill-code",
- *       when: "sync",
- *       // Rows from before `code` was required. Every row gets its own value:
- *       // gen_random_uuid() is volatile, so it is evaluated once per row.
+ *       // `fullname` is being dropped in this same sync. Effects run before
+ *       // drops, so it can still be read.
+ *       name: "split-fullname",
+ *       when: "once",
  *       run: ({ tx }) => tx.query(
- *         `UPDATE projects SET code = left(gen_random_uuid()::text, 8) WHERE code IS NULL`,
+ *         `UPDATE people SET first = split_part(fullname, ' ', 1) WHERE first IS NULL`,
  *       ),
  *     },
  *   ];

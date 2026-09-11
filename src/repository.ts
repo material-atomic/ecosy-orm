@@ -9,7 +9,23 @@ import { QueryBuilder, SchemaBuilder } from "./query-builder";
 type WriteHook =
   | "beforeInsert" | "afterInsert"
   | "beforeUpdate" | "afterUpdate"
-  | "beforeRemove" | "afterRemove";
+  | "beforeRemove" | "afterRemove"
+  | "beforeRestore" | "afterRestore";
+
+/** Which rows beyond the live ones a call may reach, on an entity with `softDelete`. */
+export interface ScopeOptions {
+  withDeleted?: boolean | undefined;
+  onlyDeleted?: boolean | undefined;
+}
+
+export interface DeleteOptions extends ScopeOptions {
+  /**
+   * Delete for real on a soft-deleting entity. The scope rule still holds:
+   * live rows unless `withDeleted` / `onlyDeleted` — so a purge says
+   * `{ hard: true, onlyDeleted: true }`.
+   */
+  hard?: boolean | undefined;
+}
 
 export type FindCondition<T> =
   | T
@@ -56,6 +72,10 @@ export interface FindOptions<Entity extends BaseEntity> {
   order?: PartialInput<Record<Extract<keyof Entity, string>, OrderDirection>> | undefined;
   limit?: number | undefined;
   offset?: number | undefined;
+  /** Soft-deleting entities only: include soft-deleted rows. */
+  withDeleted?: boolean | undefined;
+  /** Soft-deleting entities only: return soft-deleted rows and nothing else. */
+  onlyDeleted?: boolean | undefined;
 }
 
 /**
@@ -145,16 +165,37 @@ export interface ColumnOptions {
   name?: string | undefined;
   primaryKey?: boolean | undefined;
   notNull?: boolean | undefined;
-  unique?: boolean | undefined;
+  /**
+   * `true` — unique across every row, soft-deleted ones included.
+   * `"live"` — unique among live rows only; needs `softDelete` on the entity.
+   *
+   * `true` is the safe default on purpose. A value a soft-deleted row gave up
+   * can be taken by someone else, and for a label that sits inside a shared
+   * link that means an old link opening another person's project. Getting
+   * `true` wrong fails loudly with 23505; getting `"live"` wrong fails
+   * silently. So the one that has to be asked for is the permissive one —
+   * right for an email a deleted account should free for re-registration.
+   *
+   * A `"live"` column is a partial unique index, not a constraint, and a
+   * foreign key cannot point at one: Postgres requires a full unique target.
+   */
+  unique?: boolean | "live" | undefined;
   default?: string | undefined;
   references?: string | undefined;
   private?: boolean | undefined;
+  /**
+   * Silences sync's warning that this foreign key's `ON DELETE` / `ON UPDATE`
+   * action changes rows past the entity's hooks — for when that is the
+   * point, as with a purge that relies on the cascade to clear children.
+   */
+  acknowledgeHookBypass?: boolean | undefined;
 }
 
 export interface IndexOptions {
   name: string;
   columns: readonly string[];
-  unique?: boolean | undefined;
+  /** `"live"`: unique among rows that are not soft-deleted. See {@link ColumnOptions.unique}. */
+  unique?: boolean | "live" | undefined;
 }
 
 export interface CheckOptions {
@@ -165,6 +206,8 @@ export interface CheckOptions {
 export interface SchemaOptions {
   columns: Record<string, ColumnOptions>;
   indexes?: readonly IndexOptions[] | undefined;
+  /** The property key of the entity's soft-delete column. See `Entity.create`. */
+  softDelete?: string | undefined;
   /**
    * Declared here or not at all.
    *
@@ -239,9 +282,10 @@ export abstract class Repository<Entity extends BaseEntity> {
    * `connection` is a transaction here — the caller's or one opened for the
    * write — and there is always a commit to attach to.
    */
-  protected hookContext(): HookContext {
+  protected hookContext(extra: Partial<HookContext> = {}): HookContext {
     const tx = this.connection;
     return {
+      ...extra,
       db: tx,
       afterCommit: (fn) => {
         if (!(tx instanceof Transaction)) {
@@ -297,9 +341,9 @@ export abstract class Repository<Entity extends BaseEntity> {
   }
 
   /** Runs an after-hook, or `beforeRemove`, over rows already read back. In order, one at a time. */
-  protected async each(rows: Entity[], hook: WriteHook) {
+  protected async each(rows: Entity[], hook: WriteHook, extra: Partial<HookContext> = {}) {
     if (!this.has(hook)) return;
-    const context = this.hookContext();
+    const context = this.hookContext(extra);
     for (const row of rows) await (row as any)[hook](context);
   }
 
@@ -374,17 +418,28 @@ export abstract class Repository<Entity extends BaseEntity> {
   async update(
     where: FindWhereOptions<Entity>,
     data: PartialInput<Entity>,
-    options: { returning?: boolean | undefined } = {},
+    options: { returning?: boolean | undefined } & ScopeOptions = {},
   ): Promise<{ rows: Entity[]; rowCount: number }> {
     const returning = Boolean(options.returning) || this.has("afterUpdate");
     if (this.has("afterUpdate")) this.assertCanReturn("afterUpdate");
+    const scope = this.queryBuilder.resolveScope(where, options);
 
     const run = async (repo: this) => {
       const [patch] = await repo.prepare([data], "beforeUpdate");
+
+      const soft = repo.schema.softDelete;
+      if (soft && (patch as any)[soft] !== undefined) {
+        throw new Error(
+          `[Repository] update() on ${repo.entityName} sets "${soft}", the soft-delete column. ` +
+            `Use delete() or restore(): writing it here would delete or restore past their hooks.`,
+        );
+      }
+
       const { sql, params } = repo.queryBuilder.buildUpdate(
         where,
         patch!,
         returning && repo.queryBuilder.canReturn,
+        scope,
       );
       if (!sql) return { rows: [], rowCount: 0 };
 
@@ -398,13 +453,31 @@ export abstract class Repository<Entity extends BaseEntity> {
   }
 
   /**
-   * Deletes every row matching `where`.
+   * Deletes every row matching `where` — soft-deleting them, on an entity with
+   * `softDelete`, unless `hard` is set.
    *
-   * `rows` holds the deleted rows when the entity declares `afterRemove`, and
+   * `rows` holds the removed rows when the entity declares `afterRemove`, and
    * is empty otherwise. With `beforeRemove`, the matching rows are read and
-   * locked first, each one's hook runs, and exactly those rows are deleted.
+   * locked first, each one's hook runs, and exactly those rows are removed.
+   * Both hooks see soft and hard deletes alike, told apart by `soft`.
    */
-  async delete(where: FindWhereOptions<Entity>): Promise<{ rows: Entity[]; rowCount: number }> {
+  async delete(
+    where: FindWhereOptions<Entity>,
+    options: DeleteOptions = {},
+  ): Promise<{ rows: Entity[]; rowCount: number }> {
+    const soft = Boolean(this.schema.softDelete) && !options.hard;
+
+    /* A soft delete stamps live rows, and only live rows. Reaching deleted ones
+       would stamp them again — erasing when they were deleted, which is the
+       mark a restore uses to tell one deletion from another. */
+    if (soft && (options.withDeleted || options.onlyDeleted)) {
+      throw new Error(
+        `[Repository] ${this.entityName}: a soft delete reaches live rows only. withDeleted / ` +
+          `onlyDeleted apply with { hard: true }.`,
+      );
+    }
+    const scope = this.queryBuilder.resolveScope(where, options);
+
     const before = this.has("beforeRemove");
     const after = this.has("afterRemove");
     if (after) this.assertCanReturn("afterRemove");
@@ -416,21 +489,87 @@ export abstract class Repository<Entity extends BaseEntity> {
         /* Locked, so what the hooks approved is what goes: a concurrent write
            cannot slip a new match in between, or change a row after its hook
            looked at it. */
-        const select = repo.queryBuilder.buildSelect({ where });
+        const select = repo.queryBuilder.buildSelect({ where, withDeleted: options.withDeleted, onlyDeleted: options.onlyDeleted });
         const found = await repo.connection.query(`${select.sql} FOR UPDATE`, select.params);
         const rows = repo.hydrateRows(found.rows);
         if (!rows.length) return { rows: [], rowCount: 0 };
 
-        await repo.each(rows, "beforeRemove");
+        await repo.each(rows, "beforeRemove", { soft });
 
         const pk = repo.getPrimaryKeyField();
         target = rows.map((row) => ({ [pk]: (row as any)[pk] })) as FindWhereOptions<Entity>;
       }
 
-      const { sql, params } = repo.queryBuilder.buildDelete(target, after);
+      const { sql, params } = soft
+        ? repo.queryBuilder.buildSoftDelete(target, after)
+        : repo.queryBuilder.buildDelete(target, after, scope);
       const result = await repo.connection.query(sql, params);
       const rows = after ? repo.hydrateRows(result.rows) : [];
-      await repo.each(rows, "afterRemove");
+      await repo.each(rows, "afterRemove", { soft });
+      return { rows, rowCount: result.rowCount };
+    };
+
+    return before || after ? this.atomically(run) : run(this);
+  }
+
+  /**
+   * Brings soft-deleted rows matching `where` back.
+   *
+   * All or nothing. Restoring a value that a live row has taken since — an
+   * email re-registered, a file re-created at the same path, on a column or
+   * index that is `unique: "live"` — fails the whole restore with the value
+   * named, and nothing comes back.
+   *
+   * To restore what a parent took with it, match its stamp: soft-delete
+   * stamps are the transaction's start time, so a parent and the children its
+   * afterRemove deleted share one. In beforeRestore, `this` is still deleted
+   * and still carries it:
+   *
+   * @example
+   * async beforeRestore({ db }) {
+   *   await new FileRepository().using(db).restore({ projectId: this.id, deletedAt: this.deletedAt });
+   * }
+   */
+  async restore(where: FindWhereOptions<Entity>): Promise<{ rows: Entity[]; rowCount: number }> {
+    if (!this.schema.softDelete) {
+      throw new Error(`[Repository] restore() on ${this.entityName}, which has no softDelete column.`);
+    }
+
+    const before = this.has("beforeRestore");
+    const after = this.has("afterRestore");
+    if (after) this.assertCanReturn("afterRestore");
+
+    const run = async (repo: this) => {
+      let target = where;
+
+      if (before) {
+        const select = repo.queryBuilder.buildSelect({ where, onlyDeleted: true });
+        const found = await repo.connection.query(`${select.sql} FOR UPDATE`, select.params);
+        const rows = repo.hydrateRows(found.rows);
+        if (!rows.length) return { rows: [], rowCount: 0 };
+
+        await repo.each(rows, "beforeRestore");
+
+        const pk = repo.getPrimaryKeyField();
+        target = rows.map((row) => ({ [pk]: (row as any)[pk] })) as FindWhereOptions<Entity>;
+      }
+
+      const { sql, params } = repo.queryBuilder.buildRestore(target, after);
+      let result;
+      try {
+        result = await repo.connection.query(sql, params);
+      } catch (error: any) {
+        if (error?.code === "23505") {
+          throw new Error(
+            `[Repository] Restoring ${repo.entityName} would duplicate a value a live row holds ` +
+              `now${error.detail ? ` — ${error.detail}` : ""}. Nothing was restored.`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+      const rows = after ? repo.hydrateRows(result.rows) : [];
+      await repo.each(rows, "afterRestore");
       return { rows, rowCount: result.rowCount };
     };
 
