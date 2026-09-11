@@ -5,6 +5,7 @@ import { DataSource } from "./data-source";
 import { currentLogger } from "./logger";
 import { createRepository, type Repository } from "./repository";
 import { withLock } from "./lock";
+import { currentSyncContext, syncContext } from "./sync-context";
 
 /** What an effect is handed. Both halves are bound to the effect's own transaction. */
 export interface EffectContext<T extends Entity = Entity> {
@@ -32,6 +33,19 @@ export interface EffectContext<T extends Entity = Entity> {
  *   the same transaction as the work, so a failed run leaves no record and is
  *   attempted again; a succeeded one is never repeated. Renaming it makes it a
  *   different effect, which runs again.
+ *
+ * Everything an effect does goes through the `tx` or the `repository` it is
+ * handed, or a repository bound to it with `.using(tx)`. A statement sent to
+ * the pool from inside an effect is refused: it would run outside the effect's
+ * transaction, not roll back with it, not see what it has written — and if it
+ * touched a row the effect had written, wait on the effect's own lock forever,
+ * a hang Postgres cannot detect because the other side is only idle in
+ * transaction. An `afterCommit` callback runs after the effect and may use the
+ * pool.
+ *
+ * Sync holds up to three connections while an effect runs — its lock, the
+ * effects' lock, the effect's transaction — so the pool's `max` must be 3 or
+ * more; sync refuses to start otherwise rather than wait on itself.
  *
  * Each effect runs in its own transaction, under a lock per entity, so two
  * processes booting together take turns rather than both deciding a `"once"`
@@ -114,7 +128,14 @@ export async function runEffects(EntityClass: any): Promise<void> {
             if (done.rows.length) return;
           }
 
-          await effect.run({ repository: createRepository(EntityClass).using(tx) as any, tx });
+          /* The effect's own code runs marked as such, so a statement it sends
+             to the pool instead of to `tx` is refused — see sync-context. */
+          const chain = await syncContext();
+          const outer = currentSyncContext();
+          await chain.run(
+            { syncing: outer?.syncing ?? new Set(), effect: `${entityName}:${effect.name}` },
+            () => effect.run({ repository: createRepository(EntityClass).using(tx) as any, tx }),
+          );
 
           if (effect.when === "once") {
             await tx.query(

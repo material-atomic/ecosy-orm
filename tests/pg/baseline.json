@@ -1,0 +1,13 @@
+{
+  "after-commit.test.mjs": 11,
+  "cjs.test.cjs": 1,
+  "dates.test.mjs": 5,
+  "defaults.test.mjs": 36,
+  "effects.test.mjs": 19,
+  "guards.test.mjs": 14,
+  "hooks.test.mjs": 45,
+  "migration.test.mjs": 5,
+  "soft-delete.test.mjs": 56,
+  "sync-constraints.test.mjs": 11,
+  "value-rename.test.mjs": 16
+}

@@ -8,8 +8,7 @@ import { currentDialect, currentDriver } from "./drivers/current";
 import { DataSource } from "./data-source";
 import { Transaction } from "./transaction";
 import { withLock } from "./lock";
-/* Type only — erased at build. The class itself is imported on first sync. */
-import type { AsyncLocalStorage } from "node:async_hooks";
+import { syncContext } from "./sync-context";
 
 
 /** Which rows an operation reaches on a soft-deleting entity. */
@@ -952,8 +951,8 @@ export class SchemaBuilder {
        which is released only when that effect returns. Caught by call chain,
        not by a process-wide set: concurrent syncs of one entity, which the
        lock serialises, are fine; only a sync nested inside itself is not. */
-    const chain = await syncChain();
-    const active = chain.getStore();
+    const chain = await syncContext();
+    const active = chain.getStore()?.syncing;
     if (active?.has(entityName)) {
       throw new Error(
         `[DB] syncSchema("${entityName}") was called from inside the sync of ${entityName} — from ` +
@@ -964,7 +963,10 @@ export class SchemaBuilder {
     const nested = new Set(active ?? []);
     nested.add(entityName);
 
-    return chain.run(nested, () => this.syncLocked(entityName, schema, EntityClass));
+    /* `effect: null` — a sync started from inside an effect (of another
+       entity) is sync code again, with its own locks and its own statements
+       on the pool, and is not held to the effect's rule. */
+    return chain.run({ syncing: nested, effect: null }, () => this.syncLocked(entityName, schema, EntityClass));
   }
 
   private syncLocked(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {
@@ -1521,17 +1523,4 @@ function safeMaxConnections(): number | undefined {
   } catch {
     return undefined;
   }
-}
-
-/* Loaded on first sync, not at import: this module is on the root entry, and
-   a static node:async_hooks import would put a Node builtin in the graph of
-   everything that imports @ecosy/orm for a type. */
-let chainStorage: AsyncLocalStorage<Set<string>> | null = null;
-
-async function syncChain() {
-  if (!chainStorage) {
-    const hooks = await import("node:async_hooks");
-    chainStorage ??= new hooks.AsyncLocalStorage<Set<string>>();
-  }
-  return chainStorage;
 }

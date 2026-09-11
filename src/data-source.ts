@@ -5,6 +5,7 @@ import { Transaction } from "./transaction";
 import { currentLogger, setLogger, type Logger } from "./logger";
 import type { Driver, QueryResultLike } from "./drivers/types";
 import { currentDriver, setDriver } from "./drivers/current";
+import { refuseInsideEffect } from "./sync-context";
 
 export class DataSource {
   private static _entities: EntityConstructor<any>[] = [];
@@ -110,6 +111,7 @@ export class DataSource {
   static async transaction(): Promise<Transaction>;
   static async transaction<T>(fn: (tx: Transaction) => Promise<T>): Promise<T>;
   static async transaction<T>(fn?: (tx: Transaction) => Promise<T>): Promise<T | Transaction> {
+    refuseInsideEffect("A new transaction");
     const connection = await this.current.acquire();
 
     try {
@@ -135,6 +137,7 @@ export class DataSource {
 
   /** Runs a statement on the pool. */
   async query<Row = any>(sql: string, params?: unknown[]): Promise<QueryResultLike<Row>> {
+    refuseInsideEffect("A query");
     return DataSource.current.query<Row>(sql, params);
   }
 
