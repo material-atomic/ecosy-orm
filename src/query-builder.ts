@@ -474,20 +474,52 @@ export class SchemaBuilder {
      */
     private sync: SyncOptions = safeSyncOptions(),
   ) {
+    this.base = this.connection;
+    const real = this.connection;
+    const isRead = (sql: string) => /^\s*(SELECT|WITH)\b/i.test(sql);
+    const flat = (sql: string) => sql.replace(/\s+/g, " ").trim();
+
     if (this.sync.dryRun) {
-      const real = this.connection;
       const planned = this.planned;
       /* Reads go through, so the plan is made against the database as it is;
          anything else is recorded and answered with nothing. */
       this.connection = {
         query: async (sql: string, params?: unknown[]) => {
-          if (/^\s*(SELECT|WITH)\b/i.test(sql)) return real.query(sql, params);
-          planned.push(sql.replace(/\s+/g, " ").trim());
+          if (isRead(sql)) return real.query(sql, params);
+          planned.push(flat(sql));
           currentLogger().info(`[DB] plan: ${planned[planned.length - 1]}`);
           return { rows: [], rowCount: 0 };
         },
       };
+    } else {
+      /* Every statement that changes the schema says so, as it runs. An
+         automatic schema change that only a dry run would have shown — a
+         DROP NOT NULL on a kept column, found by reading information_schema —
+         is one nobody can audit afterwards. The snapshot bookkeeping is the one
+         write left out: it happens on every sync and changes nothing. */
+      this.connection = {
+        query: async (sql: string, params?: unknown[]) => {
+          const result = await real.query(sql, params);
+          if (!isRead(sql) && !sql.includes(SchemaBuilder.SNAPSHOT_TABLE)) {
+            currentLogger().info(`[DB] ran: ${flat(sql)}`);
+          }
+          return result;
+        },
+      };
     }
+  }
+
+  /** The connection as given, before the plan/announce wrapper. */
+  private readonly base: Queryable;
+
+  /**
+   * Narration of something sync is doing — "Setting the default of …". Not in
+   * a dry run: the `plan:` line already says what would happen, and a line in
+   * the present tense above it reads as if it had.
+   */
+  private act(level: "info" | "warn", message: string) {
+    if (this.sync.dryRun) return;
+    currentLogger()[level](message);
   }
 
   /** With `dryRun`: every statement sync would have sent, in order. */
@@ -732,7 +764,7 @@ export class SchemaBuilder {
           this.keep(entityName, `default of ${dbCol}`);
           continue;
         }
-        currentLogger().warn(`[DB] Dropping the default of ${entityName}.${dbCol} — the entity no longer declares one.`);
+        this.act("warn", `[DB] Dropping the default of ${entityName}.${dbCol} — the entity no longer declares one.`);
         await this.connection.query(this.dialect.alterDefault(entityName, dbCol, null));
         continue;
       }
@@ -752,8 +784,8 @@ export class SchemaBuilder {
         /* The probe needs one session for its temporary table. A transaction
            is one, so the builder's own connection is used when it is one; the
            pool is not, so a transaction is borrowed from it otherwise. */
-        rendered = this.connection instanceof Transaction
-          ? await render(this.connection, defs)
+        rendered = this.base instanceof Transaction
+          ? await render(this.base, defs)
           : await DataSource.transaction((tx) => render(tx, defs));
       } catch (error: any) {
         /* 42501: no TEMP privilege. Refusing to boot over a comparison is out
@@ -771,7 +803,7 @@ export class SchemaBuilder {
     }
 
     for (const { dbCol, expression } of toSet) {
-      currentLogger().info(`[DB] Setting the default of ${entityName}.${dbCol} to ${expression}.`);
+      this.act("info", `[DB] Setting the default of ${entityName}.${dbCol} to ${expression}.`);
       await this.connection.query(this.dialect.alterDefault(entityName, dbCol, expression));
     }
   }
@@ -823,7 +855,7 @@ export class SchemaBuilder {
           }
           throw error;
         }
-        currentLogger().warn(`[DB] ${entityName}.${dbCol}: default collided on a unique value, retrying (${attempt}/${attempts}).`);
+        this.act("warn", `[DB] ${entityName}.${dbCol}: default collided on a unique value, retrying (${attempt}/${attempts}).`);
       }
     }
   }
@@ -894,7 +926,7 @@ export class SchemaBuilder {
       if (!current || current.declared === null || current.declared.trim() === chk.expression.trim()) continue;
 
       const wide = `${chk.name}_ecosy_wide`;
-      currentLogger().info(`[DB] Check ${chk.name} on ${entityName} changed — admitting old and new values while effects run.`);
+      this.act("info", `[DB] Check ${chk.name} on ${entityName} changed — admitting old and new values while effects run.`);
       /* Not under a lock: two processes booting on the same change both get
          here. Every step therefore tolerates the other having done it first —
          IF EXISTS on the drops, 42710 (already exists) on the add. */
@@ -931,7 +963,7 @@ export class SchemaBuilder {
     if (!this.dialect.validateCheck) return;
     try {
       await this.connection.query(this.dialect.validateCheck(entityName, chk.name));
-      currentLogger().info(`[DB] Check ${chk.name} on ${entityName} validated — every row satisfies it now.`);
+      this.act("info", `[DB] Check ${chk.name} on ${entityName} validated — every row satisfies it now.`);
     } catch (error: any) {
       if (error?.code !== "23514") throw error;
       await this.explainUnvalidated(entityName, chk);
@@ -1072,7 +1104,7 @@ export class SchemaBuilder {
        entity now uses. Left to the reconciliation below, each one would be a
        drop and an add — the same two statements, and the data gone. */
     for (const { from, to } of this.renames(previous, schema, existingCols)) {
-      currentLogger().warn(`[DB] Renaming ${entityName}.${from} → ${to}`);
+      this.act("warn", `[DB] Renaming ${entityName}.${from} → ${to}`);
       await this.connection.query(this.dialect.renameColumn(entityName, from, to));
       existingCols[to] = { ...existingCols[from], name: to };
       delete existingCols[from];
@@ -1121,7 +1153,7 @@ export class SchemaBuilder {
          compared by whether one contains the other's words rather than as
          strings. Getting that wrong rewrites every column on every boot. */
       if (this.typeDiffers(opt.type as string, existingCols[dbCol])) {
-        currentLogger().warn(
+        this.act("warn", 
           `[DB] ${entityName}.${dbCol}: ${existingCols[dbCol].type} → ${opt.type} — the column is rewritten.`,
         );
         await this.connection.query(
@@ -1160,7 +1192,7 @@ export class SchemaBuilder {
          with one: the entity said what an absent value is, and a NULL row is
          a row with an absent value. */
       if (n > 0 && opt.default) {
-        currentLogger().warn(
+        this.act("warn", 
           `[DB] Filling ${n} NULL row${n === 1 ? "" : "s"} of ${entityName}.${dbCol} from its ` +
             `default before applying NOT NULL.`,
         );
@@ -1200,11 +1232,12 @@ export class SchemaBuilder {
       if (declared.has(name)) continue;
 
       if (!this.removes) {
-        this.keep(entityName, `column ${name}`);
+        const loosen = !existingCols[name]!.nullable;
+        this.keep(entityName, `column ${name}${loosen ? ` (${this.sync.dryRun ? "would be made" : "made"} nullable)` : ""}`);
         /* Kept, but no longer allowed to refuse a row: inserts written against
            the entity do not mention it, and NOT NULL without a default would
            fail every one of them. */
-        if (!existingCols[name]!.nullable) {
+        if (loosen) {
           await this.connection.query(this.dialect.alterNullable(entityName, name, existingCols[name]!.type, false));
         }
         continue;
@@ -1221,14 +1254,14 @@ export class SchemaBuilder {
          on: reading that it exists is not the same as it running. */
       if (!this.sync.snapshot && added.length) {
         currentLogger().warn(
-          `[DB] ${entityName}.${name} is being dropped while ${added.join(", ")} ` +
-            `${added.length === 1 ? "was" : "were"} added. If that is a rename, the data is ` +
-            `about to be lost — sync cannot tell a rename from a drop-and-add without ` +
+          `[DB] ${entityName}.${name} ${this.sync.dryRun ? "would be" : "is being"} dropped while ${added.join(", ")} ` +
+            `${added.length === 1 ? "was" : "were"} added. If that is a rename, the data ` +
+            `${this.sync.dryRun ? "would be" : "is about to be"} lost — sync cannot tell a rename from a drop-and-add without ` +
             `\`sync: { snapshot: true }\` on the driver, which is off by default.`,
         );
       }
 
-      currentLogger().warn(`[DB] Dropping ${entityName}.${name} — the entity no longer declares it.`);
+      this.act("warn", `[DB] Dropping ${entityName}.${name} — the entity no longer declares it.`);
       await this.connection.query(this.dialect.dropColumn(entityName, name));
       delete existingCols[name];
     }
@@ -1281,7 +1314,7 @@ export class SchemaBuilder {
       }
 
       if (current) {
-        currentLogger().warn(
+        this.act("warn", 
           `[DB] Dropping foreign key ${current.name} on ${entityName}.${column} — ` +
             (wanted
               ? `the entity now points it at ${wanted}.`
@@ -1333,12 +1366,12 @@ export class SchemaBuilder {
 
         if (opt.unique === true && !existing) {
           await this.assertUnique(entityName, schema, [key], false);
-          currentLogger().info(`[DB] Adding a unique constraint on ${entityName}.${dbCol}.`);
+          this.act("info", `[DB] Adding a unique constraint on ${entityName}.${dbCol}.`);
           await this.connection.query(this.dialect.addUnique(entityName, `${entityName}_${dbCol}_key`, dbCol));
         } else if (opt.unique !== true && existing && opt.unique !== "live" && !this.removes) {
           this.keep(entityName, `unique constraint ${existing}`);
         } else if (opt.unique !== true && existing) {
-          currentLogger().warn(
+          this.act("warn", 
             `[DB] Dropping the unique constraint on ${entityName}.${dbCol} — the entity ` +
               `${opt.unique === "live" ? 'now declares it unique: "live"' : "no longer declares it unique"}.`,
           );
@@ -1373,7 +1406,7 @@ export class SchemaBuilder {
         : !/\sWHERE\s/i.test(currentDef);
 
       if (!colsMatch || !uniqueMatch || !predicateMatch) {
-        currentLogger().warn(`[DB] Recreating index ${idx.name} on ${entityName}.`);
+        this.act("warn", `[DB] Recreating index ${idx.name} on ${entityName}.`);
         await this.connection.query(`DROP INDEX ${this.dialect.quote(idx.name)}`);
         if (idx.unique) await this.assertUnique(entityName, schema, idx.columns, live);
         await this.connection.query(create);
@@ -1395,7 +1428,7 @@ export class SchemaBuilder {
         continue;
       }
 
-      currentLogger().warn(`[DB] Dropping index ${name} on ${entityName} — no longer declared.`);
+      this.act("warn", `[DB] Dropping index ${name} on ${entityName} — no longer declared.`);
       await this.connection.query(`DROP INDEX ${this.dialect.quote(name)}`);
     }
 
@@ -1458,7 +1491,7 @@ export class SchemaBuilder {
         : existing.declared.trim() !== chk.expression.trim();
 
       if (changed) {
-        currentLogger().warn(
+        this.act("warn", 
           existing.declared === null
             ? `[DB] Recreating check constraint ${chk.name} on ${entityName} once, to record ` +
               `what it was declared from.`
@@ -1518,7 +1551,7 @@ export class SchemaBuilder {
       }
 
       if (!name.endsWith("_ecosy_wide")) {
-        currentLogger().warn(`[DB] Dropping check ${name} on ${entityName} — no longer declared.`);
+        this.act("warn", `[DB] Dropping check ${name} on ${entityName} — no longer declared.`);
       }
       await this.connection.query(
         `ALTER TABLE ${table} DROP CONSTRAINT IF EXISTS ${this.dialect.quote(name)}`,
@@ -1532,10 +1565,20 @@ export class SchemaBuilder {
     const kept = this.leftovers.get(entityName);
     if (kept?.length) {
       this.leftovers.delete(entityName);
+      /* A column kept while another was added in the same sync is what a
+         rename looks like without a snapshot: the new column arrives empty
+         and the data stays behind in the old one. */
+      const keptColumns = kept.some((k) => k.startsWith("column "));
+      const renameHint = keptColumns && added.length
+        ? ` If ${added.join(", ")} ${added.length === 1 ? "is" : "are"} a rename of a kept column, the data stayed ` +
+          `in the old one: copy it across in an effect (the old column is still readable there), and turn on ` +
+          `sync: { snapshot: true } so the next rename is recognised and moved.`
+        : "";
       currentLogger().warn(
-        `[DB] ${entityName}: kept ${kept.length} thing${kept.length === 1 ? "" : "s"} the entity no longer ` +
-          `declares — ${kept.join(", ")}. Sync is additive and removes nothing. Drop ${kept.length === 1 ? "it" : "them"} ` +
-          `with a migration, or set sync: { mode: "mirror" } on the driver to let sync remove what the entity does not say.`,
+        `[DB] ${entityName}: ${this.sync.dryRun ? "would keep" : "kept"} ${kept.length} thing${kept.length === 1 ? "" : "s"} ` +
+          `the entity no longer declares — ${kept.join(", ")}. Sync is additive and removes nothing. Drop ` +
+          `${kept.length === 1 ? "it" : "them"} with a migration, or set sync: { mode: "mirror" } on the driver to let ` +
+          `sync remove what the entity does not say.${renameHint}`,
       );
     }
 

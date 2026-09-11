@@ -58,6 +58,11 @@ eq("default, unique, foreign key, index and check are all still there", {
 eq("what the entity added was added", cols.some((c) => c.column_name === "nick"), true);
 eq("one warning names everything kept and how to remove it",
   said(/sm_rows: kept 6 things the entity no longer declares — .*column legacy.*Sync is additive.*mode: "mirror"/), true);
+eq("the DROP NOT NULL on the kept column announced itself as it ran",
+  said(/\[DB\] ran: ALTER TABLE "sm_rows" ALTER COLUMN "legacy" DROP NOT NULL/), true);
+eq("…and the kept list says the column was made nullable", said(/column legacy \(made nullable\)/), true);
+eq("the ADD COLUMN announced itself too", said(/\[DB\] ran: ALTER TABLE "sm_rows" ADD COLUMN "nick"/), true);
+eq("a column kept while another was added gets the rename hint", said(/If nick is a rename of a kept column, the data stayed in the old one/), true);
 
 section("additive still applies what the entity changed");
 const v3 = { ...v2, checks: [{ name: "sm_rows_score_ok", expression: "score >= 0 AND score <= 100" }] };
@@ -97,6 +102,20 @@ section("dry run: plans, writes nothing");
   ], [true, true, true, true]);
   eq("effects are listed, not run", [effectRan, planner.planned.some((s) => /effects of sm_rows would run here: never/.test(s))], [false, true]);
 
+  /* BotChat: "Setting the default of labels.color…" sat right above the plan:
+     lines, in the present tense, in a run that changed nothing. */
+  logs.length = 0;
+  const withDefault = { ...v1, columns: { ...v1.columns, score: { type: "INTEGER", notNull: true, default: "5" } } };
+  await new SchemaBuilder(db, DataSource.dialect, { dryRun: true, mode: "mirror" }).syncSchema("sm_rows", Entity.create("sm_rows", withDefault).schema);
+  eq("dry run: the change appears as a plan line", said(/plan: ALTER TABLE "sm_rows" ALTER COLUMN "score" SET DEFAULT 5/), true);
+  eq("dry run: no line narrates it as done", logs.filter((l) => /Setting the default|Dropping|Recreating|Adding a unique|validated|\] ran:/.test(l)), []);
+  logs.length = 0;
+  /* By here mirror has dropped legacy; `name` is the NOT NULL column to leave out. */
+  const { name: _omit, ...withoutName } = v2.columns;
+  await new SchemaBuilder(db, DataSource.dialect, { dryRun: true }).syncSchema("sm_rows", Entity.create("sm_rows", { columns: withoutName }).schema);
+  eq("dry run, additive: the kept list is in the conditional", said(/sm_rows: would keep .*column name \(would be made nullable\)/), true);
+  eq("…and nothing was loosened", (await one(`SELECT is_nullable FROM information_schema.columns WHERE table_name = 'sm_rows' AND column_name = 'name'`)).is_nullable, "NO");
+
   const fresh = new SchemaBuilder(db, DataSource.dialect, { dryRun: true });
   await fresh.syncSchema("sm_new", Entity.create("sm_new", { columns: { id: { type: "SERIAL", primaryKey: true } } }).schema);
   eq("a table that does not exist is planned, not created", [fresh.planned.some((s) => /^CREATE TABLE "sm_new"/.test(s)), (await one(`SELECT to_regclass('sm_new') IS NULL AS absent`)).absent], [true, true]);
@@ -105,6 +124,30 @@ section("dry run: plans, writes nothing");
   logs.length = 0;
   await DataSource.entities([Entity.create("sm_boot", { columns: { id: { type: "SERIAL", primaryKey: true } } })]).initialize();
   eq("initialize with dryRun says what it planned, and changes nothing", [said(/Dry run: \d+ statements? planned across 1 entity, nothing changed/), (await one(`SELECT to_regclass('sm_boot') IS NULL AS absent`)).absent], [true, true]);
+}
+
+section("renames in additive mode (LandingBuilder)");
+{
+  DataSource.driver(PgDriver({ connectionString: process.env.TEST_DATABASE_URL }));
+  const person = (name) => Entity.create("sm_person", { columns: {
+    id: { type: "SERIAL", primaryKey: true },
+    fullName: { type: "TEXT", name },
+  } });
+  await createRepository(person("full_name")).syncSchema();
+  await db.query(`INSERT INTO sm_person (full_name) VALUES ('Ada')`);
+  await createRepository(person("display_name")).syncSchema();
+  const p = (await db.query(`SELECT * FROM sm_person`)).rows[0];
+  eq("without a snapshot: old column kept with its data, new one added empty", [p.full_name, p.display_name], ["Ada", null]);
+
+  await db.query(`DROP TABLE sm_person`);
+  DataSource.driver(PgDriver({ connectionString: process.env.TEST_DATABASE_URL, sync: { snapshot: true } }));
+  await createRepository(person("full_name")).syncSchema();
+  await db.query(`INSERT INTO sm_person (full_name) VALUES ('Ada')`);
+  logs.length = 0;
+  await createRepository(person("display_name")).syncSchema();
+  const q = (await db.query(`SELECT * FROM sm_person`)).rows[0];
+  eq("with a snapshot: the column is renamed and the data moves — additive mode or not", [q.display_name, "full_name" in q], ["Ada", false]);
+  eq("…announced as it ran", said(/ran: ALTER TABLE "sm_person" RENAME COLUMN "full_name" TO "display_name"/), true);
 }
 
 await done();

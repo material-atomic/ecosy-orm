@@ -9,6 +9,6 @@
   "migration.test.mjs": 5,
   "soft-delete.test.mjs": 56,
   "sync-constraints.test.mjs": 11,
-  "sync-modes.test.mjs": 14,
+  "sync-modes.test.mjs": 25,
   "value-rename.test.mjs": 16
 }
