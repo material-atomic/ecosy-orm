@@ -2,8 +2,14 @@
 import type { PartialInput } from "./optional";
 import type { Entity as BaseEntity, EntityConstructor } from "./entity";
 import { DataSource } from "./data-source";
+import { Transaction } from "./transaction";
 import type { Queryable } from "./drivers/types";
 import { QueryBuilder, SchemaBuilder } from "./query-builder";
+
+type WriteHook =
+  | "beforeInsert" | "afterInsert"
+  | "beforeUpdate" | "afterUpdate"
+  | "beforeRemove" | "afterRemove";
 
 export type FindCondition<T> =
   | T
@@ -228,31 +234,68 @@ export abstract class Repository<Entity extends BaseEntity> {
     return rows.map(row => (this.entityClass as any).hydrate(row, this));
   }
 
+  /** Whether the entity declares this lifecycle hook. */
+  protected has(hook: WriteHook): boolean {
+    return typeof (this.entityClass.prototype as any)[hook] === "function";
+  }
+
   /**
-   * Runs `beforeInsert` or `beforeUpdate` over each row, if the entity
-   * declares it, and returns what the hook left behind.
+   * Runs `fn` on a transaction: this repository's own when it is already
+   * bound to one, a new one otherwise.
+   *
+   * Used only when the entity declares a hook for the operation. A hook's work
+   * and the write it belongs to have to land together — an `afterInsert` that
+   * throws on the pool would report failure for a row that is already
+   * committed. Entities without hooks keep the single statement they had.
+   */
+  protected atomically<T>(fn: (repo: this) => Promise<T>): Promise<T> {
+    if (this.connection instanceof Transaction) return fn(this);
+    return DataSource.transaction((tx) => fn(this.using(tx)));
+  }
+
+  /**
+   * Runs `beforeInsert` or `beforeUpdate` over each row and returns what the
+   * hook left behind.
    *
    * The hook gets a real instance as `this` — the same class `find` returns —
    * so it reads and assigns fields as it would anywhere else. What comes back
    * is the instance's own fields, which the builder then filters to declared
    * columns; nothing a hook adds that is not a column reaches the SQL.
-   *
-   * Entities without the hook skip all of this, and pay nothing for it.
    */
   protected async prepare(
     rows: PartialInput<Entity>[],
     hook: "beforeInsert" | "beforeUpdate",
   ): Promise<PartialInput<Entity>[]> {
-    if (typeof (this.entityClass.prototype as any)[hook] !== "function") return rows;
+    if (!this.has(hook)) return rows;
 
     const prepared: PartialInput<Entity>[] = [];
     for (const row of rows) {
       const instance = new this.entityClass();
       Object.assign(instance, row);
-      await (instance as any)[hook]();
+      await (instance as any)[hook]({ db: this.connection });
       prepared.push({ ...(instance as any) });
     }
     return prepared;
+  }
+
+  /** Runs an after-hook, or `beforeRemove`, over rows already read back. In order, one at a time. */
+  protected async each(rows: Entity[], hook: WriteHook) {
+    if (!this.has(hook)) return;
+    for (const row of rows) await (row as any)[hook]({ db: this.connection });
+  }
+
+  /**
+   * An after-hook needs the rows a write touched, and only `RETURNING` says
+   * which. On an engine without it the hook could only be skipped — silently,
+   * which is worse than refusing.
+   */
+  protected assertCanReturn(hook: WriteHook) {
+    if (!this.queryBuilder.canReturn) {
+      throw new Error(
+        `[Repository] ${this.entityName} declares ${hook}(), which needs the rows a write ` +
+          `touched, and driver "${DataSource.current.name}" cannot return them (no RETURNING).`,
+      );
+    }
   }
 
   /**
@@ -279,13 +322,24 @@ export abstract class Repository<Entity extends BaseEntity> {
   async insert(data: PartialInput<Entity>[]): Promise<Entity[]>;
   async insert(data: PartialInput<Entity> | PartialInput<Entity>[]): Promise<Entity | Entity[] | null> {
     const isArray = Array.isArray(data);
-    const arr = await this.prepare(isArray ? data : [data], "beforeInsert");
-    if (!arr.length) return isArray ? [] : null;
-    
-    const { sql, params } = this.queryBuilder.buildInsert(arr);
-    const result = await this.connection.query(sql, params);
+    const input = isArray ? data : [data];
+    if (!input.length) return isArray ? [] : null;
 
-    return isArray ? this.hydrateRows(result.rows) : this.hydrateRows(result.rows)[0];
+    const run = async (repo: this) => {
+      const arr = await repo.prepare(input, "beforeInsert");
+      const { sql, params } = repo.queryBuilder.buildInsert(arr);
+      const result = await repo.connection.query(sql, params);
+      const rows = repo.hydrateRows(result.rows);
+      await repo.each(rows, "afterInsert");
+      return rows;
+    };
+
+    if (this.has("afterInsert")) this.assertCanReturn("afterInsert");
+    const rows = this.has("beforeInsert") || this.has("afterInsert")
+      ? await this.atomically(run)
+      : await run(this);
+
+    return isArray ? rows : (rows[0] ?? null);
   }
 
   /**
@@ -294,29 +348,91 @@ export abstract class Repository<Entity extends BaseEntity> {
    * A field set to `undefined` is not written — the column keeps what it had.
    * A patch with nothing left to write (after `beforeUpdate`) runs no statement
    * and reports no rows, rather than sending `SET` with nothing after it.
+   *
+   * `rows` holds the updated rows when they were asked for — `returning: true`,
+   * or an entity that declares `afterUpdate` — and is empty otherwise.
    */
-  async update(where: FindWhereOptions<Entity>, data: PartialInput<Entity>) {
-    const [patch] = await this.prepare([data], "beforeUpdate");
-    const { sql, params } = this.queryBuilder.buildUpdate(where, patch!);
-    if (!sql) return { rows: [], rowCount: 0 };
-    return this.connection.query(sql, params);
+  async update(
+    where: FindWhereOptions<Entity>,
+    data: PartialInput<Entity>,
+    options: { returning?: boolean | undefined } = {},
+  ): Promise<{ rows: Entity[]; rowCount: number }> {
+    const returning = Boolean(options.returning) || this.has("afterUpdate");
+    if (this.has("afterUpdate")) this.assertCanReturn("afterUpdate");
+
+    const run = async (repo: this) => {
+      const [patch] = await repo.prepare([data], "beforeUpdate");
+      const { sql, params } = repo.queryBuilder.buildUpdate(
+        where,
+        patch!,
+        returning && repo.queryBuilder.canReturn,
+      );
+      if (!sql) return { rows: [], rowCount: 0 };
+
+      const result = await repo.connection.query(sql, params);
+      const rows = returning ? repo.hydrateRows(result.rows) : [];
+      await repo.each(rows, "afterUpdate");
+      return { rows, rowCount: result.rowCount };
+    };
+
+    return this.has("beforeUpdate") || this.has("afterUpdate") ? this.atomically(run) : run(this);
   }
 
-  delete(where: FindWhereOptions<Entity>) {
-    const { sql, params } = this.queryBuilder.buildDelete(where);
-    return this.connection.query(sql, params);
+  /**
+   * Deletes every row matching `where`.
+   *
+   * `rows` holds the deleted rows when the entity declares `afterRemove`, and
+   * is empty otherwise. With `beforeRemove`, the matching rows are read and
+   * locked first, each one's hook runs, and exactly those rows are deleted.
+   */
+  async delete(where: FindWhereOptions<Entity>): Promise<{ rows: Entity[]; rowCount: number }> {
+    const before = this.has("beforeRemove");
+    const after = this.has("afterRemove");
+    if (after) this.assertCanReturn("afterRemove");
+
+    const run = async (repo: this) => {
+      let target = where;
+
+      if (before) {
+        /* Locked, so what the hooks approved is what goes: a concurrent write
+           cannot slip a new match in between, or change a row after its hook
+           looked at it. */
+        const select = repo.queryBuilder.buildSelect({ where });
+        const found = await repo.connection.query(`${select.sql} FOR UPDATE`, select.params);
+        const rows = repo.hydrateRows(found.rows);
+        if (!rows.length) return { rows: [], rowCount: 0 };
+
+        await repo.each(rows, "beforeRemove");
+
+        const pk = repo.getPrimaryKeyField();
+        target = rows.map((row) => ({ [pk]: (row as any)[pk] })) as FindWhereOptions<Entity>;
+      }
+
+      const { sql, params } = repo.queryBuilder.buildDelete(target, after);
+      const result = await repo.connection.query(sql, params);
+      const rows = after ? repo.hydrateRows(result.rows) : [];
+      await repo.each(rows, "afterRemove");
+      return { rows, rowCount: result.rowCount };
+    };
+
+    return before || after ? this.atomically(run) : run(this);
   }
 
   async upsert(data: PartialInput<Entity>, conflictColumns: string[]): Promise<Entity>;
   async upsert(data: PartialInput<Entity>[], conflictColumns: string[]): Promise<Entity[]>;
   async upsert(data: PartialInput<Entity> | PartialInput<Entity>[], conflictColumns: string[]): Promise<Entity | Entity[] | null> {
     const isArray = Array.isArray(data);
-    const arr = await this.prepare(isArray ? data : [data], "beforeInsert");
-    if (!arr.length) return isArray ? [] : null;
-    
-    const { sql, params } = this.queryBuilder.buildUpsert(arr, conflictColumns);
-    const result = await this.connection.query(sql, params);
-    
-    return isArray ? this.hydrateRows(result.rows) : this.hydrateRows(result.rows)[0];
+    const input = isArray ? data : [data];
+    if (!input.length) return isArray ? [] : null;
+
+    const run = async (repo: this) => {
+      const arr = await repo.prepare(input, "beforeInsert");
+      const { sql, params } = repo.queryBuilder.buildUpsert(arr, conflictColumns);
+      const result = await repo.connection.query(sql, params);
+      return repo.hydrateRows(result.rows);
+    };
+
+    const rows = this.has("beforeInsert") ? await this.atomically(run) : await run(this);
+    return isArray ? rows : (rows[0] ?? null);
   }
 }

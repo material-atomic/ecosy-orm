@@ -2,6 +2,21 @@
 import type { PartialInput } from "./optional";
 import type { Repository, FindWhereOptions, ColumnOptions, IndexOptions, CheckOptions } from "./repository";
 import type { EntityEffect } from "./effects";
+import type { Queryable } from "./drivers/types";
+
+/**
+ * What a lifecycle hook is handed.
+ *
+ * `db` is the connection the write itself is running on. Whenever an entity
+ * declares a hook for an operation, that operation runs in a transaction —
+ * the caller's, when the repository was bound with `using(tx)`, or one opened
+ * for it otherwise — so a hook that writes through `db` commits or rolls back
+ * together with the row it was called for, and a hook that throws undoes the
+ * write. That is what TypeORM does around `save()`, for the same reason.
+ */
+export interface HookContext {
+  db: Queryable;
+}
 
 export type InferColumnType<T extends string> = 
   T extends "TEXT" | "UUID" ? string :
@@ -35,17 +50,29 @@ export abstract class Entity {
    */
   readonly _repository?: Repository<this>;
 
+  /*
+   * Lifecycle hooks. Declare any of them as a method on the subclass; `this` is
+   * a real instance of it. Each one is looked up once per call and costs
+   * nothing on an entity that does not declare it.
+   *
+   * Unlike TypeORM, these fire on the repository's bulk methods too — `update`
+   * and `delete` by WHERE, not only on `save()` and `remove()` of a loaded
+   * entity. A hook that only some call sites trigger is a rule only some call
+   * sites follow, which is the problem hooks exist to remove.
+   *
+   * `upsert()` runs `beforeInsert` but no after-hook: the statement does not
+   * say, per row, whether it inserted or updated, and guessing would run the
+   * wrong one.
+   */
+
   /**
-   * Runs before a row is inserted, with `this` as the row about to be written.
+   * Before a row is inserted, with `this` as the row about to be written.
    * Whatever it assigns is written; whatever it leaves `undefined` falls back
    * to the column's default.
    *
-   * Called for `insert()`, for `upsert()` — a row there may become an insert,
-   * and a `NOT NULL` column it fills is needed either way — and for `save()`
-   * on a row with no primary key. It is not called for SQL written by hand.
-   *
-   * May be async; rows of a multi-row insert are prepared one after another,
-   * then written in one statement.
+   * Runs for `insert()`, `upsert()` and `save()` on a row with no primary key.
+   * Rows of a multi-row insert are prepared one after another, then written in
+   * one statement.
    *
    * @example
    * class ProjectEntity extends Entity.create("projects", configs) {
@@ -54,26 +81,62 @@ export abstract class Entity {
    *   }
    * }
    */
-  beforeInsert?(): void | Promise<void>;
+  beforeInsert?(context: HookContext): void | Promise<void>;
 
   /**
-   * Runs before an update, with `this` holding **only the fields being
-   * written** — `update(where, patch)` is addressed by a WHERE clause that may
-   * match many rows or none, so there is no single row to hand over. The one
-   * exception is `save()`, which writes the whole instance.
+   * After a row is inserted, with `this` as the row as stored — generated id
+   * and defaults included. Throwing rolls the insert back.
+   *
+   * @example
+   * async afterInsert({ db }) {
+   *   await db.query(`INSERT INTO audit (entity, id) VALUES ('projects', $1)`, [this.id]);
+   * }
+   */
+  afterInsert?(context: HookContext): void | Promise<void>;
+
+  /**
+   * Before an update, with `this` holding **only the fields being written** —
+   * `update(where, patch)` is addressed by a WHERE clause that may match many
+   * rows or none, so there is no single row to hand over. `save()` is the
+   * exception: it writes, and so hands over, the whole instance.
    *
    * @example
    * beforeUpdate() {
    *   this.updatedAt = new Date().toISOString();
    * }
    */
-  beforeUpdate?(): void | Promise<void>;
+  beforeUpdate?(context: HookContext): void | Promise<void>;
 
   /**
-   * Runs on every row read back — `find`, `findOne`, and the rows `insert` and
-   * `upsert` return. Synchronous on purpose: it runs once per row of every
-   * query, and an await there is paid ten thousand times on a large page.
-   * Prefer a getter for anything that can be computed when it is read.
+   * After an update, once per row it changed, with `this` as that row as now
+   * stored. Declaring it makes the update return the rows (`RETURNING`), which
+   * is the only way to know which rows those were. Throwing rolls it back.
+   */
+  afterUpdate?(context: HookContext): void | Promise<void>;
+
+  /**
+   * Before a row is deleted, once per row about to go, with `this` as that
+   * row. Throwing stops the delete — nothing is removed.
+   *
+   * A delete by WHERE names no rows, so declaring this makes `delete()` read
+   * the matching rows first, locked (`FOR UPDATE`), and then delete exactly
+   * those: a row that starts matching in between is not removed without its
+   * hook having seen it.
+   */
+  beforeRemove?(context: HookContext): void | Promise<void>;
+
+  /**
+   * After a row is deleted, once per row removed, with `this` as the row as it
+   * was. Declaring it makes the delete return the rows (`RETURNING`). Throwing
+   * rolls the delete back.
+   */
+  afterRemove?(context: HookContext): void | Promise<void>;
+
+  /**
+   * On every row read back — `find`, `findOne`, and the rows a write returns.
+   * Synchronous on purpose: it runs once per row of every query, and an await
+   * there is paid ten thousand times on a large page. Prefer a getter for
+   * anything that can be computed when it is read.
    */
   afterLoad?(): void;
 
@@ -207,7 +270,15 @@ export abstract class Entity {
       const updateData: Record<string, unknown> = { ...(this as unknown as Record<string, unknown>) };
       delete updateData[pkField];
       
-      await repo.update({ [pkField]: pkValue } as FindWhereOptions<this>, updateData as PartialInput<this>);
+      /* Read back, so this instance goes on describing the row: whatever
+         beforeUpdate assigned went to a copy, and would otherwise be written
+         to the database and missing from here. */
+      const { rows } = await repo.update(
+        { [pkField]: pkValue } as FindWhereOptions<this>,
+        updateData as PartialInput<this>,
+        { returning: true },
+      );
+      if (rows[0]) Object.assign(this, rows[0]);
       return this;
     } else {
       const inserted = await repo.insert(this);

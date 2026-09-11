@@ -69,6 +69,11 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return this.dialect.supportsReturning ? ` RETURNING ${this.getQueryColumns()}` : "";
   }
 
+  /** Whether this engine can hand back the rows a write touched. */
+  get canReturn(): boolean {
+    return this.dialect.supportsReturning;
+  }
+
   private buildWhereSql(where: FindWhereOptions<Entity>, params: any[]): string {
     if (Array.isArray(where)) {
       const conditions = where.map((w: FindWhereOptions<Entity>) => this.buildWhereSql(w, params)).filter(Boolean);
@@ -212,7 +217,11 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return { sql, params };
   }
 
-  buildUpdate(where: FindWhereOptions<Entity>, data: PartialInput<Entity>): { sql: string, params: any[] } {
+  buildUpdate(
+    where: FindWhereOptions<Entity>,
+    data: PartialInput<Entity>,
+    returning = false,
+  ): { sql: string, params: any[] } {
     const params: any[] = [];
     const given = Object.entries(data).filter(
       ([tsKey, v]) => tsKey in this.schema.columns && v !== undefined,
@@ -232,19 +241,19 @@ export class QueryBuilder<Entity extends BaseEntity> {
     const sql = [
       `UPDATE ${this.entityName} SET ${assignments}`,
       condition ? `WHERE ${condition}` : "",
-    ].filter(Boolean).join(" ");
+    ].filter(Boolean).join(" ") + (returning ? this.returning() : "");
 
     return { sql, params };
   }
 
-  buildDelete(where: FindWhereOptions<Entity>): { sql: string, params: any[] } {
+  buildDelete(where: FindWhereOptions<Entity>, returning = false): { sql: string, params: any[] } {
     const params: any[] = [];
     const condition = this.buildWhereSql(where, params);
     
     const sql = [
       `DELETE FROM ${this.entityName}`,
       condition ? `WHERE ${condition}` : "",
-    ].filter(Boolean).join(" ");
+    ].filter(Boolean).join(" ") + (returning ? this.returning() : "");
 
     return { sql, params };
   }

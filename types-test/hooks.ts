@@ -6,7 +6,7 @@
  * guards is that a subclass can write the hooks without a single cast.
  */
 
-import { Entity, Repository, type EntityEffect } from "../src/index";
+import { Entity, Repository, type EntityEffect, type HookContext } from "../src/index";
 
 const configs = {
   columns: {
@@ -30,6 +30,24 @@ export class ProjectEntity extends Entity.create("projects", configs) {
   afterLoad() {
     const label: string = this.name;
     void label;
+  }
+
+  async afterInsert({ db }: HookContext) {
+    // `db` is the write's own connection; this lands or rolls back with it.
+    await db.query(`INSERT INTO audit (id) VALUES ($1)`, [this.id]);
+  }
+
+  afterUpdate() {
+    const code: string = this.code;
+    void code;
+  }
+
+  beforeRemove() {
+    if (this.name === "protected") throw new Error("refused");
+  }
+
+  async afterRemove({ db }: HookContext) {
+    await db.query(`DELETE FROM project_files WHERE project_id = $1`, [this.id]);
   }
 
   static effects: EntityEffect<ProjectEntity>[] = [
@@ -58,6 +76,14 @@ export class ProjectEntity extends Entity.create("projects", configs) {
 export class ProjectRepository extends Repository<ProjectEntity> {
   constructor() {
     super(ProjectEntity);
+  }
+
+  async rename(id: string, name: string) {
+    // update/delete report the rows they touched, as entities.
+    const { rows, rowCount } = await this.update({ id }, { name }, { returning: true });
+    const first: ProjectEntity | undefined = rows[0];
+    void first;
+    return rowCount;
   }
 }
 
