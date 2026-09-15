@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { PartialInput, WriteInput } from "./optional";
-import type { Repository, FindWhereOptions, ColumnOptions, IndexOptions, CheckOptions } from "./repository";
+import type { Repository, FindWhereOptions, ColumnOptions, IndexOptions, CheckOptions, SchemaOptions } from "./repository";
 import type { EntityEffect } from "./effects";
 import type { Queryable } from "./drivers/types";
 
@@ -48,11 +48,36 @@ export type InferColumnType<T extends string> =
   T extends "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" ? Date :
   unknown;
 
+/**
+ * The type a column's property holds: what its transformer's `from` returns
+ * when it declares one, what the SQL type implies otherwise.
+ */
+export type ColumnValue<Col extends ColumnOptions> =
+  Col extends { transformer: { from(stored: never): infer Value } } ? Value : InferColumnType<Col["type"]>;
+
 export type InferSchema<TCols extends Record<string, ColumnOptions>> = {
-  -readonly [K in keyof TCols]: TCols[K]["notNull"] extends true 
-    ? InferColumnType<TCols[K]["type"]> 
-    : InferColumnType<TCols[K]["type"]> | null;
+  -readonly [K in keyof TCols]: TCols[K]["notNull"] extends true
+    ? ColumnValue<TCols[K]>
+    : ColumnValue<TCols[K]> | null;
 };
+
+/**
+ * A row as the application sees it: every column that declares a transformer
+ * read back through its `from`. Copied only when something changes.
+ */
+function readColumns<Row>(schema: SchemaOptions | undefined, row: Row): Row {
+  const columns = schema?.columns;
+  if (!columns || !row) return row;
+
+  let copy: Record<string, unknown> | null = null;
+  for (const [key, opt] of Object.entries(columns)) {
+    const value = (row as Record<string, unknown>)[key];
+    if (!opt.transformer || value === null || value === undefined) continue;
+    copy ??= { ...(row as Record<string, unknown>) };
+    copy[key] = opt.transformer.from(value);
+  }
+  return (copy ?? row) as Row;
+}
 
 /**
  * Keys of columns that can hold a soft-delete timestamp: a TIMESTAMP or
@@ -210,7 +235,7 @@ export abstract class Entity {
     repo: Repository<any>
   ): T {
     const instance = new this();
-    Object.assign(instance, data);
+    Object.assign(instance, readColumns((this as unknown as { schema?: SchemaOptions }).schema, data));
 
     if (typeof instance.afterLoad === "function") {
       const result: unknown = instance.afterLoad();

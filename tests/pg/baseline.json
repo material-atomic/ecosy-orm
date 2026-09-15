@@ -10,5 +10,7 @@
   "soft-delete.test.mjs": 56,
   "sync-constraints.test.mjs": 11,
   "sync-modes.test.mjs": 25,
-  "value-rename.test.mjs": 16
+  "sync-types.test.mjs": 24,
+  "value-rename.test.mjs": 16,
+  "vector.test.mjs": 31
 }

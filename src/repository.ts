@@ -160,6 +160,12 @@ export function Between<T>(value: [T, T]) {
   } as const;
 }
 
+/** See {@link ColumnOptions.transformer}. */
+export interface ColumnTransformer<Value = unknown, Stored = unknown> {
+  to(value: Value): Stored;
+  from(stored: Stored): Value;
+}
+
 export interface ColumnOptions {
   type: string;
   name?: string | undefined;
@@ -189,6 +195,16 @@ export interface ColumnOptions {
    * point, as with a purge that relies on the cascade to clear children.
    */
   acknowledgeHookBypass?: boolean | undefined;
+  /**
+   * Converts between what the application holds and what the column stores:
+   * `to` on every write and every equality `where` value, `from` on every row
+   * read back. Neither is called for `null` or `undefined` — a missing value
+   * stays missing.
+   *
+   * The entity's property takes the type `from` returns, so a transformer
+   * handing back `number[]` makes the field a `number[]`.
+   */
+  transformer?: ColumnTransformer | undefined;
 }
 
 export interface IndexOptions {
@@ -196,6 +212,15 @@ export interface IndexOptions {
   columns: readonly string[];
   /** `"live"`: unique among rows that are not soft-deleted. See {@link ColumnOptions.unique}. */
   unique?: boolean | "live" | undefined;
+  /** The index method — `"gin"`, `"gist"`, `"hnsw"`. Omitted: the engine's default, a b-tree on Postgres. */
+  using?: string | undefined;
+  /** An operator class applied to every column — `"jsonb_path_ops"`, `"vector_cosine_ops"`. */
+  opclass?: string | undefined;
+  /**
+   * Storage parameters — `{ m: 16, ef_construction: 64 }`. A changed value is a
+   * different index and rebuilds it; values compare as the engine writes them back.
+   */
+  with?: Readonly<Record<string, string | number | boolean>> | undefined;
 }
 
 export interface CheckOptions {

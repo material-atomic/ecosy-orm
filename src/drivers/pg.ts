@@ -115,12 +115,19 @@ const dialect: Dialect = {
   },
 
   async listColumns(db, table): Promise<ColumnInfo[]> {
+    /* `format_type` from the catalogue beside information_schema's category:
+       for an extension's type or an array, `data_type` says only `USER-DEFINED`
+       or `ARRAY`, and the modifier — a vector's dimensions — is nowhere else. */
     const result = await db.query(
-      `SELECT column_name, is_nullable, data_type, column_default,
-              character_maximum_length, numeric_precision, numeric_scale
-         FROM information_schema.columns
-        WHERE table_name = $1
-          AND table_schema = ANY(current_schemas(false))`,
+      `SELECT c.column_name, c.is_nullable, c.data_type, c.column_default,
+              c.character_maximum_length, c.numeric_precision, c.numeric_scale,
+              format_type(a.atttypid, a.atttypmod) AS formatted
+         FROM information_schema.columns c
+         JOIN pg_attribute a
+           ON a.attrelid = format('%I.%I', c.table_schema, c.table_name)::regclass
+          AND a.attname = c.column_name
+        WHERE c.table_name = $1
+          AND c.table_schema = ANY(current_schemas(false))`,
       [table],
     );
     return result.rows.map((row: any) => ({
@@ -131,6 +138,7 @@ const dialect: Dialect = {
       length: row.character_maximum_length ?? null,
       precision: row.numeric_precision ?? null,
       scale: row.numeric_scale ?? null,
+      formatted: row.formatted ?? null,
     }));
   },
 
@@ -225,6 +233,29 @@ const dialect: Dialect = {
     `ALTER TABLE ${dialect.quote(table)} ALTER COLUMN ${dialect.quote(column)} ` +
     `TYPE ${type} USING ${dialect.quote(column)}::${type}`,
 
+  async listExtensions(db) {
+    const result = await db.query(`SELECT extname FROM pg_extension`);
+    return result.rows.map((row: any) => String(row.extname));
+  },
+
+  createExtension: (name) => `CREATE EXTENSION IF NOT EXISTS ${dialect.quote(name)}`,
+
+  async listIndexOpclasses(db, table) {
+    const result = await db.query(
+      `SELECT i.relname AS indexname,
+              string_agg(opc.opcname, ',' ORDER BY k.ord) AS opclasses
+         FROM pg_index ix
+         JOIN pg_class i ON i.oid = ix.indexrelid
+         JOIN pg_class t ON t.oid = ix.indrelid
+         CROSS JOIN LATERAL unnest(ix.indclass::oid[]) WITH ORDINALITY AS k(opclass, ord)
+         JOIN pg_opclass opc ON opc.oid = k.opclass
+        WHERE t.relname = $1
+        GROUP BY i.relname`,
+      [table],
+    );
+    return Object.fromEntries(result.rows.map((row: any) => [row.indexname, String(row.opclasses).split(",")]));
+  },
+
   async listIndexes(db, table) {
     const result = await db.query(
       `SELECT indexname, indexdef FROM pg_indexes WHERE tablename = $1`,
@@ -283,6 +314,8 @@ const dialect: Dialect = {
 export interface PgDriverConfig extends PartialInput<PoolConfig> {
   /** See {@link SyncOptions}. Not passed to `pg`. */
   sync?: SyncOptions | undefined;
+  /** See {@link Driver.extensions}. Not passed to `pg`. */
+  extensions?: readonly string[] | undefined;
 }
 
 
@@ -317,7 +350,7 @@ function describeTarget(config: Record<string, unknown>): string {
 export function PgDriver(config: PgDriverConfig): Driver {
   /* Split before the rest reaches `new Pool()`, which is handed the object
      untouched and would carry an option it knows nothing about. */
-  const { sync = {}, ...poolConfig } = config;
+  const { sync = {}, extensions = [], ...poolConfig } = config;
 
   /* An empty `connectionString` is not the same as no `connectionString`.
    *
@@ -358,6 +391,7 @@ export function PgDriver(config: PgDriverConfig): Driver {
     name: "pg",
     dialect,
     sync,
+    extensions,
     /* pg's own default when `max` is not given. */
     maxConnections: Number((poolConfig as PoolConfig).max ?? 10),
 

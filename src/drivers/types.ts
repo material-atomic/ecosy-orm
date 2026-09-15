@@ -39,6 +39,16 @@ export interface ColumnInfo {
   length?: number | null;
   precision?: number | null;
   scale?: number | null;
+  /**
+   * The type as the engine writes it back, modifier included — `vector(1536)`,
+   * `text[]`, an enum's own name.
+   *
+   * `type` is a category, and for two families it names nothing: `USER-DEFINED`
+   * covers every type an extension or `CREATE TYPE` added, `ARRAY` every array.
+   * Compared against those alone, each such column read as changed and was
+   * retyped on every boot.
+   */
+  formatted?: string | null;
 }
 
 /**
@@ -138,6 +148,15 @@ export interface Dialect {
   listColumns(db: Queryable, table: string): Promise<ColumnInfo[]>;
   /** Index name to its definition, for deciding whether one has to be rebuilt. */
   listIndexes(db: Queryable, table: string): Promise<Record<string, string>>;
+  /**
+   * Index name to the operator class of each of its columns, in order.
+   *
+   * Read from the catalogue because the definition cannot say it: Postgres
+   * leaves a column's default class out, so an index declared with
+   * `jsonb_ops` — the default for GIN on jsonb — never shows the name, and a
+   * comparison against the definition would rebuild it on every boot.
+   */
+  listIndexOpclasses?(db: Queryable, table: string): Promise<Record<string, string[]>>;
   /** Check-constraint name to its expression. */
   listChecks(
     db: Queryable,
@@ -224,6 +243,11 @@ export interface Dialect {
   renameColumn(table: string, from: string, to: string): string;
   /** Changes a column's type in place. */
   alterType(table: string, column: string, type: string): string;
+
+  /** Extensions installed in the database. Absent: the engine has none to list. */
+  listExtensions?(db: Queryable): Promise<string[]>;
+  /** Installs an extension, doing nothing when it is already there. */
+  createExtension?(name: string): string;
 }
 
 /**
@@ -308,4 +332,12 @@ export interface Driver extends Queryable {
    * fail, it waits for itself. Knowing the size lets sync refuse up front.
    */
   readonly maxConnections?: number;
+
+  /**
+   * Extensions sync installs before it touches any table — `vector`, `citext`,
+   * `pg_trgm`. A column whose type an extension provides cannot be created
+   * before the extension is, and an entity effect is too late for that: it runs
+   * once its table exists.
+   */
+  readonly extensions?: readonly string[];
 }

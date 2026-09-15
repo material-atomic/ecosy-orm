@@ -3,7 +3,7 @@ import type { PartialInput } from "./optional";
 import { currentLogger } from "./logger";
 import type { FindOptions, FindWhereOptions, ObjectWhere, SchemaOptions } from "./repository";
 import type { Entity as BaseEntity } from "./entity";
-import type { ColumnInfo, Dialect, Queryable, SyncOptions } from "./drivers/types";
+import type { ColumnInfo, Dialect, Driver, Queryable, SyncOptions } from "./drivers/types";
 import { currentDialect, currentDriver } from "./drivers/current";
 import { DataSource } from "./data-source";
 import { Transaction } from "./transaction";
@@ -46,7 +46,14 @@ export class QueryBuilder<Entity extends BaseEntity> {
    * since the driver parses jsonb back into real objects and arrays.
    */
   private encode(tsKey: string, value: any) {
-    const type = (this.schema.columns[tsKey]?.type || "").toUpperCase();
+    const column = this.schema.columns[tsKey];
+    /* A declared transformer owns the conversion outright; the JSON handling
+       below is what a column without one gets. */
+    if (column?.transformer && value !== null && value !== undefined) {
+      return column.transformer.to(value);
+    }
+
+    const type = (column?.type || "").toUpperCase();
     const isJson = type === "JSON" || type === "JSONB";
 
     if (!isJson || value === null || value === undefined || typeof value === "string") {
@@ -575,11 +582,17 @@ export class SchemaBuilder {
 
   private indexStatement(entityName: string, schema: SchemaOptions, idx: any) {
     const unique = idx.unique ? "UNIQUE " : "";
+    const opclass = idx.opclass ? ` ${sqlName("operator class", idx.opclass)}` : "";
     const cols = idx.columns
-      .map((c: string) => this.dialect.quote(schema.columns[c]?.name || c))
+      .map((c: string) => `${this.dialect.quote(schema.columns[c]?.name || c)}${opclass}`)
       .join(", ");
+    const using = idx.using ? ` USING ${sqlName("index method", idx.using)}` : "";
+    const params = Object.entries((idx.with ?? {}) as Record<string, string | number | boolean>);
+    const withClause = params.length
+      ? ` WITH (${params.map(([key, value]) => `${sqlName("storage parameter", key)} = ${storageValue(value)}`).join(", ")})`
+      : "";
     const where = idx.unique === "live" ? ` WHERE ${this.livePredicate(schema)}` : "";
-    return `CREATE ${unique}INDEX ${this.dialect.quote(idx.name)} ON ${this.dialect.quote(entityName)} (${cols})${where}`;
+    return `CREATE ${unique}INDEX ${this.dialect.quote(idx.name)} ON ${this.dialect.quote(entityName)}${using} (${cols})${withClause}${where}`;
   }
 
   private livePredicate(schema: SchemaOptions) {
@@ -1034,7 +1047,62 @@ export class SchemaBuilder {
           `holds. An effect already runs mid-sync; do the work in it directly.`,
       );
     }
+    await this.ensureExtensions();
     return withinFrame("sync", entityName, () => this.syncLocked(entityName, schema, EntityClass));
+  }
+
+  /**
+   * Installs the driver's `extensions` before any table is touched, once per
+   * process and driver.
+   *
+   * Under a lock: replicas booting together would otherwise both find an
+   * extension missing and both create it, and the second fails on the catalog's
+   * unique index even with `IF NOT EXISTS`. Only the missing ones are created,
+   * so a boot with everything in place runs no statement and logs none.
+   */
+  private async ensureExtensions() {
+    let driver: Driver;
+    try {
+      driver = currentDriver();
+    } catch {
+      return;
+    }
+
+    const wanted = driver.extensions ?? [];
+    if (!wanted.length) return;
+
+    const done = readyExtensions.get(driver) ?? new Set<string>();
+    if (wanted.every((name) => done.has(name))) return;
+
+    const dialect = this.dialect;
+    if (!dialect.listExtensions || !dialect.createExtension) {
+      throw new Error(
+        `[DB] The ${driver.name} driver lists extensions (${wanted.join(", ")}), but its dialect cannot install one.`,
+      );
+    }
+
+    const install = async () => {
+      const present = new Set(await dialect.listExtensions!(this.connection));
+      for (const name of wanted) {
+        if (present.has(name)) continue;
+        try {
+          await this.connection.query(dialect.createExtension!(name));
+        } catch (error) {
+          throw new Error(
+            `[DB] Could not create extension "${name}": ${error instanceof Error ? error.message : String(error)}. ` +
+              `Installing an extension usually takes a superuser or the database owner — install it once by ` +
+              `hand with that role, or grant the privilege to the role this app connects as.`,
+            { cause: error },
+          );
+        }
+      }
+    };
+
+    if (this.sync.dryRun) return install();
+
+    await withLock("ecosy:orm:extensions", install);
+    for (const name of wanted) done.add(name);
+    readyExtensions.set(driver, done);
   }
 
   private syncLocked(entityName: string, schema: SchemaOptions, EntityClass?: unknown) {
@@ -1154,7 +1222,7 @@ export class SchemaBuilder {
          strings. Getting that wrong rewrites every column on every boot. */
       if (this.typeDiffers(opt.type as string, existingCols[dbCol])) {
         this.act("warn", 
-          `[DB] ${entityName}.${dbCol}: ${existingCols[dbCol].type} → ${opt.type} — the column is rewritten.`,
+          `[DB] ${entityName}.${dbCol}: ${existingCols[dbCol].formatted ?? existingCols[dbCol].type} → ${opt.type} — the column is rewritten.`,
         );
         await this.connection.query(
           this.dialect.alterType(entityName, dbCol, opt.type as string),
@@ -1381,6 +1449,9 @@ export class SchemaBuilder {
     }
 
     const existingIndexes = await this.dialect.listIndexes(this.connection, entityName);
+    const existingOpclasses = this.dialect.listIndexOpclasses
+      ? await this.dialect.listIndexOpclasses(this.connection, entityName)
+      : null;
     const indexes = this.effectiveIndexes(entityName, schema);
     /* Postgres renders the predicate back as `WHERE (deleted_at IS NULL)`. */
     const flat = (text: string) => text.replace(/["\s()]/g, "").toLowerCase();
@@ -1404,8 +1475,18 @@ export class SchemaBuilder {
       const predicateMatch = live
         ? flat(currentDef).endsWith(`where${flat(this.livePredicate(schema))}`)
         : !/\sWHERE\s/i.test(currentDef);
+      /* Method, operator class and storage parameters are part of what the index
+         is: an HNSW index whose `m` changed is a different index, and so is a
+         b-tree declared where a GIN stands. The operator class is compared only
+         when declared, and from the catalogue where the dialect can read it:
+         Postgres leaves a default one out of the definition. */
+      const methodMatch = new RegExp(`\\sUSING\\s+${sqlName("index method", idx.using ?? "btree")}\\s`, "i").test(currentDef);
+      const opclassMatch = !idx.opclass || (existingOpclasses
+        ? (existingOpclasses[idx.name] ?? []).every((name) => name.toLowerCase() === String(idx.opclass).toLowerCase())
+        : new RegExp(`\\s${sqlName("operator class", idx.opclass)}\\b`, "i").test(currentDef));
+      const paramsMatch = sameStorageParams(currentDef, idx.with);
 
-      if (!colsMatch || !uniqueMatch || !predicateMatch) {
+      if (!colsMatch || !uniqueMatch || !predicateMatch || !methodMatch || !opclassMatch || !paramsMatch) {
         this.act("warn", `[DB] Recreating index ${idx.name} on ${entityName}.`);
         await this.connection.query(`DROP INDEX ${this.dialect.quote(idx.name)}`);
         if (idx.unique) await this.assertUnique(entityName, schema, idx.columns, live);
@@ -1595,6 +1676,14 @@ export class SchemaBuilder {
    * word appears in what the engine reported.
    */
   private typeDiffers(declared: string, column: ColumnInfo) {
+    /* For these two the category names none of the type — see
+       ColumnInfo.formatted — so the declaration is compared with the engine's
+       full rendering, modifier and all. Every other type keeps the comparison
+       below, unchanged. */
+    if (column.formatted && /^(user-defined|array)$/i.test(column.type)) {
+      return canonicalType(declared) !== canonicalType(column.formatted);
+    }
+
     const want = declared.toLowerCase().replace(/\(.*/, "").trim();
     const have = column.type.toLowerCase();
 
@@ -1647,6 +1736,74 @@ export class SchemaBuilder {
 function sameLiteral(rendered: string, declared: string): boolean {
   const match = /^('(?:[^']|'')*')::[a-z][\w\s."]*$/i.exec(rendered);
   return Boolean(match) && match![1] === declared;
+}
+
+/** Extensions already installed, per driver, so a process checks once. */
+const readyExtensions = new WeakMap<Driver, Set<string>>();
+
+const TYPE_ALIASES: Record<string, string> = {
+  timestamptz: "timestamp with time zone",
+  timestamp: "timestamp without time zone",
+  varchar: "character varying",
+  char: "character",
+  int8: "bigint",
+  int4: "integer",
+  int2: "smallint",
+  int: "integer",
+  bool: "boolean",
+  float8: "double precision",
+  float4: "real",
+  decimal: "numeric",
+};
+
+/**
+ * A type in one spelling for comparison: lower case, unquoted, no `public.`,
+ * the short name of a built-in written out as the engine renders it, and no
+ * whitespace. `INT[]` and `integer[]` come out the same; `vector(1536)` and
+ * `vector(768)` do not.
+ */
+function canonicalType(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/"/g, "")
+    .trim()
+    .replace(/^public\./, "")
+    .replace(/^(timestamptz|timestamp|varchar|char|int8|int4|int2|int|bool|float8|float4|decimal)(?=\s*(\(|\[|$))/, (word) => TYPE_ALIASES[word] ?? word)
+    .replace(/\s+/g, "");
+}
+
+/** A plain SQL identifier, refused otherwise — these are spliced into DDL unquoted. */
+function sqlName(what: string, value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+    throw new TypeError(`[DB] ${JSON.stringify(value)} is not a valid ${what}: letters, digits and underscores only.`);
+  }
+  return value;
+}
+
+function storageValue(value: unknown): string {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "boolean") return String(value);
+  if (typeof value === "string") return `'${value.replace(/'/g, "''")}'`;
+  throw new TypeError(`[DB] ${JSON.stringify(value)} is not a valid storage parameter value.`);
+}
+
+/**
+ * Whether an index definition carries exactly the declared storage parameters.
+ * Postgres writes `WITH (m = 16)` back as `WITH (m='16')`, so values compare as text.
+ */
+function sameStorageParams(indexdef: string, declared: Record<string, unknown> | undefined): boolean {
+  const current = new Map<string, string>();
+  const match = /\sWITH\s*\(([^)]*)\)/i.exec(indexdef);
+  if (match) {
+    for (const part of match[1]!.split(",")) {
+      const at = part.indexOf("=");
+      if (at === -1) continue;
+      current.set(part.slice(0, at).trim().toLowerCase(), part.slice(at + 1).trim().replace(/^'(.*)'$/, "$1").toLowerCase());
+    }
+  }
+  const wanted = Object.entries(declared ?? {});
+  return wanted.length === current.size &&
+    wanted.every(([key, value]) => current.get(key.toLowerCase()) === String(value).toLowerCase());
 }
 
 function safeMaxConnections(): number | undefined {
