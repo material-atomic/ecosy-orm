@@ -7,6 +7,7 @@
   "guards.test.mjs": 18,
   "hooks.test.mjs": 45,
   "migration.test.mjs": 5,
+  "seeder.test.mjs": 22,
   "soft-delete.test.mjs": 56,
   "sync-constraints.test.mjs": 11,
   "sync-modes.test.mjs": 25,

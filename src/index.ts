@@ -4,6 +4,7 @@ export * from "./query-builder";
 export * from "./repository";
 export * from "./transaction";
 export type { EntityEffect, EffectContext } from "./effects";
+export { Seeder, type SeederOptions, type SeedRow, type SeedRows } from "./seeder";
 /* The contract only. Built-in drivers live on their own subpaths and load
    their client package by dynamic import, so the root never pulls one in. */
 export type * from "./drivers/types";
