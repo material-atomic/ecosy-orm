@@ -39,11 +39,20 @@ export class QueryBuilder<Entity extends BaseEntity> {
   /**
    * Encodes a value for the column it is going into.
    *
-   * `pg` turns a plain object into JSON but turns a JS array into a Postgres
-   * array literal `{a,b}`, which `jsonb` rejects with "invalid input syntax for
-   * type json". The column type is declared, so the builder knows which values
-   * need serialising and does it for both shapes — reading stays symmetric,
-   * since the driver parses jsonb back into real objects and arrays.
+   * A JSON column is serialised here, every value of it. `pg` turns a plain
+   * object into JSON but a JS array into a Postgres array literal `{a,b}`,
+   * which `jsonb` rejects; and until 1.4.0 two more shapes went through
+   * untouched and broke on the way in:
+   *
+   * - a **string** was sent as it was, so `"basic"` reached the column as the
+   *   text `basic` — "invalid input syntax for type json". It is a value, not
+   *   JSON text, and is written as the JSON string `"basic"`.
+   * - **null** was sent as SQL NULL, which a `NOT NULL` JSON column refuses —
+   *   where the value meant JSON `null`, "no limit" in a plan's features. In a
+   *   `NOT NULL` column it is JSON `null` now; in a nullable one it stays SQL
+   *   NULL, the column's own way of saying "nothing".
+   *
+   * Reading stays symmetric: the driver parses jsonb back into the value.
    */
   private encode(tsKey: string, value: any) {
     const column = this.schema.columns[tsKey];
@@ -56,10 +65,8 @@ export class QueryBuilder<Entity extends BaseEntity> {
     const type = (column?.type || "").toUpperCase();
     const isJson = type === "JSON" || type === "JSONB";
 
-    if (!isJson || value === null || value === undefined || typeof value === "string") {
-      return value;
-    }
-
+    if (!isJson || value === undefined) return value;
+    if (value === null) return column?.notNull ? "null" : null;
     return JSON.stringify(value);
   }
 

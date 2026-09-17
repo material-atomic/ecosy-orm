@@ -65,10 +65,6 @@ function referenceTarget(references: string): { table: string; column: string } 
   return match ? { table: match[1]!, column: match[2]! } : null;
 }
 
-function isJsonColumn(column: ColumnOptions): boolean {
-  return /^jsonb?$/i.test(String(column.type).trim());
-}
-
 /** Whether the schema guarantees `key` is unique. */
 function keyIsUnique(schema: SchemaOptions, key: readonly string[]): boolean {
   const sameSet = (columns: readonly string[]) =>
@@ -97,8 +93,8 @@ function keyIsUnique(schema: SchemaOptions, key: readonly string[]): boolean {
  * - a row with no value for a key column, and two rows with the same key.
  *
  * Handled, because each has broken a hand-written seed before:
- * - **JSON columns.** Each value is serialised here, so `null` in a `NOT NULL`
- *   JSONB column is JSON `null` — not SQL NULL, which the column refuses — and a
+ * - **JSON columns**, through the repository: `null` in a `NOT NULL` JSONB
+ *   column is JSON `null` — not SQL NULL, which the column refuses — and a
  *   string is a JSON string. In a nullable JSON column `null` stays SQL NULL.
  * - **Missing parents.** A row whose `references` column points at a row that
  *   does not exist is skipped, and counted in the log, instead of failing the
@@ -265,18 +261,9 @@ export function Seeder<C extends (new () => Entity) & { entityName: string; sche
         return;
       }
 
-      /* JSON values serialised here: the repository sends a string to a JSON
-         column as it is, and null as SQL NULL — which a NOT NULL column refuses
-         where the seed meant JSON null. */
-      const prepared = candidates.map((row) => {
-        const out: Record<string, unknown> = { ...row };
-        for (const [property, column] of Object.entries(schema.columns)) {
-          if (!isJsonColumn(column) || column.transformer || !(property in out) || out[property] === undefined) continue;
-          if (out[property] === null && !column.notNull) continue;
-          out[property] = JSON.stringify(out[property]);
-        }
-        return out;
-      });
+      /* JSON values need nothing here: the repository serialises them — null
+         as JSON null in a NOT NULL column, a string as a JSON string. */
+      const prepared = candidates;
 
       for (const part of chunks(prepared)) {
         await repository.insert(part as any);
