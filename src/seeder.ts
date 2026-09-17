@@ -105,9 +105,12 @@ function keyIsUnique(schema: SchemaOptions, key: readonly string[]): boolean {
  *   column is JSON `null` — not SQL NULL, which the column refuses — and a
  *   string is a JSON string. In a nullable JSON column `null` stays SQL NULL.
  * - **Missing parents.** A row whose `references` column points at a row that
- *   does not exist is skipped, and counted in the log, instead of failing the
+ *   does not exist is skipped, with a warning saying why, instead of failing the
  *   foreign key and stopping boot. Read from the column's `references`; no
- *   option needed.
+ *   option needed. When the column refers to this same table, a row of the seed
+ *   counts as a parent and goes in first, and a row may point at itself. Rows
+ *   pointing at each other in a cycle are skipped: they could be split across
+ *   two insert statements.
  *
  * @example
  * export class PlanEntity extends Entity.create("plans", schema) {
@@ -275,9 +278,20 @@ export function Seeder<C extends (new () => Entity) & { entityName: string; sche
          the foreign key and stop boot over a row nobody needs any more — so it
          is skipped. A parent may be in the table, or, when the column refers to
          this same table, a row of this seed; those are inserted first. */
-      type SelfReference = { property: string; inTable: Set<number>; child: Map<number, string>; parent: Map<number, string> };
+      type SelfReference = {
+        property: string;
+        inTable: Set<number>;
+        child: Map<number, string>;
+        parent: Map<number, string>;
+        /** Parent key value → the seed row holding it, over the whole seed. */
+        rowOfParent: Map<string, number>;
+      };
       const selfReferences: SelfReference[] = [];
       const skippedRows: { index: number; why: string }[] = [];
+      /* The seed before any row is dropped for a parent: a row this seed holds
+         is still "in this seed" after another rule skips it, and the warning
+         has to say that rather than send someone looking for a missing row. */
+      const seedRows = candidates;
       const bareTable = (reference: string) => reference.replace(/"/g, "").replace(/^public\./i, "").toLowerCase();
 
       for (const [property, column] of Object.entries(schema.columns)) {
@@ -302,8 +316,10 @@ export function Seeder<C extends (new () => Entity) & { entityName: string; sche
         const selfProperty = bareTable(target.table) === entityName.toLowerCase() ? propertyOf(target.column) : undefined;
         if (selfProperty) {
           const child = await canonical(withValue, [property]);
-          const parent = await canonical(candidates.filter(({ row }) => row[selfProperty] !== undefined && row[selfProperty] !== null), [selfProperty]);
-          selfReferences.push({ property, inTable, child, parent });
+          const parent = await canonical(seedRows.filter(({ row }) => row[selfProperty] !== undefined && row[selfProperty] !== null), [selfProperty]);
+          const rowOfParent = new Map<string, number>();
+          for (const [index, value] of parent) rowOfParent.set(value, index);
+          selfReferences.push({ property, inTable, child, parent, rowOfParent });
           continue;
         }
 
@@ -324,12 +340,17 @@ export function Seeder<C extends (new () => Entity) & { entityName: string; sche
         const placed = selfReferences.map(() => new Set<string>());
         let remaining = candidates;
 
+        /* Satisfied: no value, a parent in the table, a parent already placed —
+           or the row itself. Postgres checks a foreign key at the end of the
+           statement, so a row pointing at its own key goes in. */
+        const satisfied = (ref: SelfReference, i: number, index: number, row: Record<string, unknown>) =>
+          row[ref.property] === undefined || row[ref.property] === null ||
+          ref.inTable.has(index) || placed[i]!.has(ref.child.get(index)!) ||
+          ref.child.get(index) === ref.parent.get(index);
+
         for (;;) {
           const ready = remaining.filter(({ index, row }) =>
-            selfReferences.every((ref, i) =>
-              row[ref.property] === undefined || row[ref.property] === null ||
-              ref.inTable.has(index) || placed[i]!.has(ref.child.get(index)!),
-            ),
+            selfReferences.every((ref, i) => satisfied(ref, i, index, row)),
           );
           if (!ready.length) break;
 
@@ -344,9 +365,42 @@ export function Seeder<C extends (new () => Entity) & { entityName: string; sche
           remaining = remaining.filter(({ index }) => !readySet.has(index));
         }
 
-        for (const { index, row } of remaining) {
-          const ref = selfReferences.find((r) => row[r.property] !== undefined && row[r.property] !== null && !r.inTable.has(index))!;
-          skippedRows.push({ index, why: `${ref.property} = ${String(row[ref.property])} points at no row in ${entityName} or in this seed` });
+        /* Why each leftover could not go in, told apart — the parent is nowhere,
+           the parent is in this seed but was itself skipped, or the rows point
+           at each other in a cycle. */
+        const leftover = new Map(remaining.map((item) => [item.index, item]));
+        const skippedEarlier = new Set(skippedRows.map(({ index }) => index));
+        const unmet = (index: number) => {
+          const row = (leftover.get(index) ?? seedRows.find((item) => item.index === index))!.row;
+          const i = selfReferences.findIndex((ref, n) => !satisfied(ref, n, index, row));
+          if (i === -1) return undefined;
+          const ref = selfReferences[i]!;
+          return { ref, value: String(row[ref.property]), parentRow: ref.rowOfParent.get(ref.child.get(index)!) };
+        };
+
+        for (const { index } of remaining) {
+          const first = unmet(index)!;
+          const label = `${first.ref.property} = ${first.value}`;
+
+          if (first.parentRow === undefined) {
+            skippedRows.push({ index, why: `${label} points at no row in ${entityName} or in this seed` });
+            continue;
+          }
+
+          const path = [index];
+          let current: number | undefined = first.parentRow;
+          while (current !== undefined && leftover.has(current) && !path.includes(current)) {
+            path.push(current);
+            current = unmet(current)?.parentRow;
+          }
+
+          if (current !== undefined && path.includes(current)) {
+            const cycle = [...path.slice(path.indexOf(current)), current];
+            skippedRows.push({ index, why: `${label} is part of a reference cycle, rows ${cycle.join(" → ")}` });
+          } else {
+            const skippedParent = current !== undefined && (skippedEarlier.has(current) || leftover.has(current)) ? current : first.parentRow;
+            skippedRows.push({ index, why: `${label} points at row ${skippedParent === first.parentRow ? first.parentRow : `${first.parentRow} (by way of row ${skippedParent})`} of this seed, which was itself skipped` });
+          }
         }
       } else if (candidates.length) {
         levels.push(candidates);
@@ -355,10 +409,10 @@ export function Seeder<C extends (new () => Entity) & { entityName: string; sche
       /* Warn, not info: a skipped row is data that did not go in, and nothing
          else would bring it to anyone's attention. */
       if (skippedRows.length) {
-        const shown = skippedRows.slice(0, 3).map(({ index, why }) => `row ${index}: ${why}`).join("; ");
+        const shown = skippedRows.slice(0, 5).map(({ index, why }) => `row ${index}: ${why}`).join("; ");
         currentLogger().warn(
           `[DB] ${name}: skipped ${skippedRows.length} row${skippedRows.length === 1 ? "" : "s"} whose parent is missing — ${shown}` +
-            (skippedRows.length > 3 ? `; and ${skippedRows.length - 3} more.` : "."),
+            (skippedRows.length > 5 ? `; and ${skippedRows.length - 5} more.` : "."),
         );
       }
 

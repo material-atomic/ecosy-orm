@@ -212,6 +212,10 @@ orm.DataSource.logger({ debug() {}, info: (m) => logs.push(String(m)), warn: (m)
 const tree = [
   { id: "leaf", parentId: "branch" },
   { id: "orphan", parentId: "nowhere" },
+  { id: "under-orphan", parentId: "orphan" },
+  { id: "cycle-a", parentId: "cycle-b" },
+  { id: "cycle-b", parentId: "cycle-a" },
+  { id: "self", parentId: "self" },
   ...Array.from({ length: 600 }, (_, i) => ({ id: `filler-${i}`, parentId: null })),
   { id: "branch", parentId: "root" },
   { id: "root", parentId: null },
@@ -229,6 +233,31 @@ eq("children listed before their parents, a parent past the first chunk: all in,
   (await all(`SELECT id FROM sd_categories WHERE id IN ('root','branch','leaf') ORDER BY id`)).map((r) => r.id), ["branch", "leaf", "root"]);
 eq("the fillers too", (await one(`SELECT count(*)::int AS n FROM sd_categories WHERE id LIKE 'filler-%'`)).n, 600);
 eq("a row pointing at nothing is left out", (await one(`SELECT count(*)::int AS n FROM sd_categories WHERE id = 'orphan'`)).n, 0);
-eq("…and that is a warning, naming it", warns.some((m) => /skipped 1 row whose parent is missing — row 1: parentId = nowhere points at no row in sd_categories or in this seed/.test(m)), true);
+const warning = warns.find((m) => /seed-categories: skipped 4 rows/.test(m)) ?? "";
+eq("a row pointing at itself goes in — Postgres checks the key at the end of the statement", (await one(`SELECT parent_id FROM sd_categories WHERE id = 'self'`))?.parent_id, "self");
+eq("rows pointing at each other in a cycle are left out", (await one(`SELECT count(*)::int AS n FROM sd_categories WHERE id LIKE 'cycle-%'`)).n, 0);
+eq("the warning: a parent that is nowhere", /row 1: parentId = nowhere points at no row in sd_categories or in this seed/.test(warning), true);
+eq("the warning: a parent in this seed that was itself skipped", /row 2: parentId = orphan points at row 1 of this seed, which was itself skipped/.test(warning), true);
+eq("the warning: a cycle, with its rows", /row 3: parentId = cycle-b is part of a reference cycle, rows 3 → 4 → 3/.test(warning), true);
+
+section("a parent skipped for another table's key is still named as in this seed");
+const nodeWarns = [];
+orm.DataSource.logger({ debug() {}, info: (m) => logs.push(String(m)), warn: (m) => { nodeWarns.push(String(m)); logs.push(String(m)); }, error: (m) => logs.push(String(m)) });
+class Nodes extends Entity.create("sd_nodes", {
+  columns: {
+    id: { type: "TEXT", primaryKey: true, notNull: true },
+    parentId: { type: "TEXT", name: "parent_id", references: "sd_nodes(id)" },
+    ownerId: { type: "UUID", name: "owner_id", references: "sd_owners(id)" },
+  },
+}) {
+  static effects = [Seeder(Nodes, [
+    { id: "child", parentId: "parent" },
+    { id: "parent", ownerId: "33333333-3333-4333-8333-333333333333" },
+  ])];
+}
+await createRepository(Nodes).syncSchema();
+const nodeWarning = nodeWarns.find((m) => /seed:sd_nodes: skipped 2 rows/.test(m)) ?? "";
+eq("the parent: its owner is missing", /row 1: ownerId = 33333333-3333-4333-8333-333333333333 has no sd_owners\(id\)/.test(nodeWarning), true);
+eq("the child: its parent is in this seed and was skipped", /row 0: parentId = parent points at row 1 of this seed, which was itself skipped/.test(nodeWarning), true);
 
 await done();
