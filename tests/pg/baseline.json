@@ -8,7 +8,7 @@
   "hooks.test.mjs": 45,
   "json.test.mjs": 14,
   "migration.test.mjs": 5,
-  "seeder.test.mjs": 22,
+  "seeder.test.mjs": 32,
   "soft-delete.test.mjs": 56,
   "sync-constraints.test.mjs": 11,
   "sync-modes.test.mjs": 25,

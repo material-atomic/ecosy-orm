@@ -4,6 +4,7 @@ import type { Entity, InferSchema } from "./entity";
 import type { EffectContext, EntityEffect } from "./effects";
 import type { WriteInput } from "./optional";
 import { currentDialect } from "./drivers/current";
+import { QueryBuilder } from "./query-builder";
 import { currentLogger } from "./logger";
 
 /** Rows for a seed, or a function returning them — for data that has to be read when the seed runs. */
@@ -63,6 +64,13 @@ function chunks<T>(list: readonly T[], size = CHUNK): T[][] {
 function referenceTarget(references: string): { table: string; column: string } | null {
   const match = /^\s*"?([\w.]+?)"?\s*\(\s*"?(\w+)"?\s*\)/.exec(references);
   return match ? { table: match[1]!, column: match[2]! } : null;
+}
+
+/** A declared type as a cast target: a serial is an integer once it exists. */
+function castType(declared: string): string {
+  const serial = /^(small|big)?serial$/i.exec(declared.trim());
+  if (!serial) return declared.trim();
+  return serial[1]?.toLowerCase() === "big" ? "BIGINT" : serial[1] ? "SMALLINT" : "INTEGER";
 }
 
 /** Whether the schema guarantees `key` is unique. */
@@ -161,8 +169,13 @@ export function Seeder<C extends (new () => Entity) & { entityName: string; sche
       const { repository, tx } = context;
       const dialect = currentDialect();
       const q = (identifier: string) => dialect.quote(identifier);
-      const dbName = (property: string) => String(schema.columns[property]?.name ?? property);
+      const $ = (n: number) => dialect.placeholder(n);
+      const quoteTable = (reference: string) => reference.split(".").map((part) => q(part.replace(/"/g, ""))).join(".");
       const table = q(entityName);
+      const builder = new QueryBuilder<InstanceType<C>>(entityName, schema, dialect);
+      const sqlType = (property: string) => castType(String(schema.columns[property]!.type));
+      const propertyOf = (column: string) =>
+        Object.entries(schema.columns).find(([key, opt]) => String(opt.name ?? key) === column)?.[0];
 
       const list = (typeof rows === "function" ? await rows() : rows) as readonly Record<string, unknown>[];
       if (!list.length) return;
@@ -184,95 +197,182 @@ export function Seeder<C extends (new () => Entity) & { entityName: string; sche
         if (any.rows.length) return;
       }
 
-      let candidates = list;
+      type Item = { index: number; row: Record<string, unknown> };
+
+      /* Every comparison below is made by the database, never on JavaScript
+         strings. Values are encoded as the repository writes them — a
+         transformer applied — and cast to the column's type, so the database
+         decides equality the way the table does: an upper-case UUID equals the
+         lower-case one it stores. Comparing `String(seed)` with
+         `String(stored)` made both look missing on the second boot, inserted
+         them again, and stopped the boot on 23505. */
+      const valuesOf = (part: readonly Item[], properties: readonly string[], params: unknown[]) =>
+        part
+          .map(({ index, row }) =>
+            `(${index}, ${properties.map((property) => {
+              params.push(builder.encodeValue(property, row[property]));
+              return `CAST(${$(params.length)} AS ${sqlType(property)})`;
+            }).join(", ")})`,
+          )
+          .join(", ");
+      const aliases = (properties: readonly string[]) => properties.map((_, i) => `c${i}`).join(", ");
+
+      /** Each item's values in the column's own text form, as the database renders them. */
+      const canonical = async (items: readonly Item[], properties: readonly string[]) => {
+        const out = new Map<number, string>();
+        for (const part of chunks(items)) {
+          const params: unknown[] = [];
+          const found = await tx.query(
+            `SELECT v.i AS i, ${properties.map((_, i) => `CAST(v.c${i} AS TEXT) AS k${i}`).join(", ")} ` +
+              `FROM (VALUES ${valuesOf(part, properties, params)}) AS v(i, ${aliases(properties)})`,
+            params,
+          );
+          for (const row of found.rows) out.set(Number(row.i), JSON.stringify(properties.map((_, i) => row[`k${i}`])));
+        }
+        return out;
+      };
+
+      const items: Item[] = list.map((row, index) => ({ index, row }));
+      let candidates = items;
 
       if (mode === "missing") {
-        const tupleOf = (row: Record<string, unknown>) => JSON.stringify(key.map((column) => String(row[column])));
-        const seen = new Set<string>();
-
-        list.forEach((row, index) => {
+        for (const { index, row } of items) {
           const absent = key.filter((column) => row[column] === undefined || row[column] === null);
           if (absent.length) {
             throw new Error(`[Seeder] ${name}: row ${index} has no value for key ${absent.map((c) => `"${c}"`).join(", ")}.`);
           }
-          const tuple = tupleOf(row);
-          if (seen.has(tuple)) {
-            throw new Error(`[Seeder] ${name}: two rows share the key (${key.map((c) => String(row[c])).join(", ")}).`);
-          }
-          seen.add(tuple);
-        });
-
-        /* Raw rather than through the repository: soft-deleted rows count as
-           present — a seed does not bring back what was deleted that way. */
-        const existing = new Set<string>();
-        const columns = key.map((column) => q(dbName(column)));
-
-        for (const part of chunks(list)) {
-          const params: unknown[] = [];
-          const tuples = part.map((row) =>
-            `(${key.map((column) => {
-              params.push(row[column]);
-              return dialect.placeholder(params.length);
-            }).join(", ")})`,
-          );
-          const target = key.length === 1 ? columns[0] : `(${columns.join(", ")})`;
-          const values = key.length === 1 ? tuples.map((tuple) => tuple.slice(1, -1)) : tuples;
-          const found = await tx.query(
-            `SELECT ${key.map((column, i) => `${columns[i]} AS ${q(column)}`).join(", ")} FROM ${table} ` +
-              `WHERE ${target} IN (${values.join(", ")})`,
-            params,
-          );
-          for (const row of found.rows) existing.add(tupleOf(row));
         }
 
-        candidates = list.filter((row) => !existing.has(tupleOf(row)));
+        const keys = await canonical(items, key);
+        const seen = new Map<string, number>();
+        for (const { index, row } of items) {
+          const value = keys.get(index)!;
+          const first = seen.get(value);
+          if (first !== undefined) {
+            throw new Error(
+              `[Seeder] ${name}: two rows share the key (${key.map((c) => String(row[c])).join(", ")}) — rows ${first} and ${index}, equal as the database compares them.`,
+            );
+          }
+          seen.set(value, index);
+        }
+
+        /* Soft-deleted rows count as present: a seed does not bring back what
+           was deleted that way. */
+        const present = new Set<number>();
+        for (const part of chunks(items)) {
+          const params: unknown[] = [];
+          const found = await tx.query(
+            `SELECT v.i AS i FROM (VALUES ${valuesOf(part, key, params)}) AS v(i, ${aliases(key)}) ` +
+              `JOIN ${table} t ON ${key.map((column, i) => `t.${q(String(schema.columns[column]!.name ?? column))} = v.c${i}`).join(" AND ")}`,
+            params,
+          );
+          for (const row of found.rows) present.add(Number(row.i));
+        }
+        candidates = items.filter(({ index }) => !present.has(index));
       }
 
-      /* Rows whose parent is not there. A foreign key would refuse them, and
-         the throw would stop boot over a row nobody needs any more. */
-      let skipped = 0;
+      /* Parents. A row whose `references` column points at nothing would fail
+         the foreign key and stop boot over a row nobody needs any more — so it
+         is skipped. A parent may be in the table, or, when the column refers to
+         this same table, a row of this seed; those are inserted first. */
+      type SelfReference = { property: string; inTable: Set<number>; child: Map<number, string>; parent: Map<number, string> };
+      const selfReferences: SelfReference[] = [];
+      const skippedRows: { index: number; why: string }[] = [];
+      const bareTable = (reference: string) => reference.replace(/"/g, "").replace(/^public\./i, "").toLowerCase();
+
       for (const [property, column] of Object.entries(schema.columns)) {
-        if (!column.references || !candidates.length) continue;
+        if (!column.references) continue;
         const target = referenceTarget(column.references);
         if (!target) continue;
 
-        const values = [...new Set(candidates.map((row) => row[property]).filter((value) => value !== undefined && value !== null))];
-        if (!values.length) continue;
+        const withValue = candidates.filter(({ row }) => row[property] !== undefined && row[property] !== null);
+        if (!withValue.length) continue;
 
-        const present = new Set<string>();
-        for (const part of chunks(values)) {
+        const inTable = new Set<number>();
+        for (const part of chunks(withValue)) {
+          const params: unknown[] = [];
           const found = await tx.query(
-            `SELECT ${q(target.column)} AS v FROM ${q(target.table)} WHERE ${q(target.column)} IN (${part.map((_, i) => dialect.placeholder(i + 1)).join(", ")})`,
-            part,
+            `SELECT v.i AS i FROM (VALUES ${valuesOf(part, [property], params)}) AS v(i, c0) ` +
+              `WHERE EXISTS (SELECT 1 FROM ${quoteTable(target.table)} p WHERE p.${q(target.column)} = v.c0)`,
+            params,
           );
-          for (const row of found.rows) present.add(String(row.v));
+          for (const row of found.rows) inTable.add(Number(row.i));
         }
 
-        const before = candidates.length;
-        candidates = candidates.filter((row) => {
-          const value = row[property];
-          return value === undefined || value === null || present.has(String(value));
+        const selfProperty = bareTable(target.table) === entityName.toLowerCase() ? propertyOf(target.column) : undefined;
+        if (selfProperty) {
+          const child = await canonical(withValue, [property]);
+          const parent = await canonical(candidates.filter(({ row }) => row[selfProperty] !== undefined && row[selfProperty] !== null), [selfProperty]);
+          selfReferences.push({ property, inTable, child, parent });
+          continue;
+        }
+
+        candidates = candidates.filter(({ index, row }) => {
+          if (row[property] === undefined || row[property] === null || inTable.has(index)) return true;
+          skippedRows.push({ index, why: `${property} = ${String(row[property])} has no ${target.table}(${target.column})` });
+          return false;
         });
-        skipped += before - candidates.length;
       }
 
-      if (!candidates.length) {
-        if (skipped) currentLogger().info(`[DB] ${name}: nothing to insert; ${skipped} row${skipped === 1 ? "" : "s"} skipped, parent missing.`);
-        return;
+      /* Rows of this seed in the order they can go in: a row is ready once every
+         row it points at is in the table or placed in an earlier level. A row
+         whose parent never becomes ready — missing, skipped, or a cycle — is
+         skipped with the rest. The order of the array does not matter, and
+         neither does which chunk a parent would have fallen into. */
+      const levels: Item[][] = [];
+      if (selfReferences.length) {
+        const placed = selfReferences.map(() => new Set<string>());
+        let remaining = candidates;
+
+        for (;;) {
+          const ready = remaining.filter(({ index, row }) =>
+            selfReferences.every((ref, i) =>
+              row[ref.property] === undefined || row[ref.property] === null ||
+              ref.inTable.has(index) || placed[i]!.has(ref.child.get(index)!),
+            ),
+          );
+          if (!ready.length) break;
+
+          levels.push(ready);
+          for (const { index } of ready) {
+            selfReferences.forEach((ref, i) => {
+              const value = ref.parent.get(index);
+              if (value !== undefined) placed[i]!.add(value);
+            });
+          }
+          const readySet = new Set(ready.map(({ index }) => index));
+          remaining = remaining.filter(({ index }) => !readySet.has(index));
+        }
+
+        for (const { index, row } of remaining) {
+          const ref = selfReferences.find((r) => row[r.property] !== undefined && row[r.property] !== null && !r.inTable.has(index))!;
+          skippedRows.push({ index, why: `${ref.property} = ${String(row[ref.property])} points at no row in ${entityName} or in this seed` });
+        }
+      } else if (candidates.length) {
+        levels.push(candidates);
       }
 
-      /* JSON values need nothing here: the repository serialises them — null
-         as JSON null in a NOT NULL column, a string as a JSON string. */
-      const prepared = candidates;
-
-      for (const part of chunks(prepared)) {
-        await repository.insert(part as any);
+      /* Warn, not info: a skipped row is data that did not go in, and nothing
+         else would bring it to anyone's attention. */
+      if (skippedRows.length) {
+        const shown = skippedRows.slice(0, 3).map(({ index, why }) => `row ${index}: ${why}`).join("; ");
+        currentLogger().warn(
+          `[DB] ${name}: skipped ${skippedRows.length} row${skippedRows.length === 1 ? "" : "s"} whose parent is missing — ${shown}` +
+            (skippedRows.length > 3 ? `; and ${skippedRows.length - 3} more.` : "."),
+        );
       }
 
-      currentLogger().info(
-        `[DB] ${name}: inserted ${prepared.length} row${prepared.length === 1 ? "" : "s"} into ${entityName}` +
-          (skipped ? `; ${skipped} skipped, parent missing.` : "."),
-      );
+      let inserted = 0;
+      for (const level of levels) {
+        for (const part of chunks(level)) {
+          await repository.insert(part.map(({ row }) => row) as any);
+          inserted += part.length;
+        }
+      }
+
+      if (inserted) {
+        currentLogger().info(`[DB] ${name}: inserted ${inserted} row${inserted === 1 ? "" : "s"} into ${entityName}.`);
+      }
     },
   };
 }

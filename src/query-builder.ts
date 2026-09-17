@@ -70,6 +70,17 @@ export class QueryBuilder<Entity extends BaseEntity> {
     return JSON.stringify(value);
   }
 
+  /**
+   * A value encoded as the builder writes it — transformer applied, JSON
+   * serialised. For code that has to compare values the way they were stored:
+   * a seed looking up which of its rows already exist.
+   *
+   * @internal
+   */
+  encodeValue(tsKey: string, value: unknown): unknown {
+    return this.encode(tsKey, value);
+  }
+
   private withEntity(tsKey: string) {
     return `${this.q(this.entityName)}.${this.q(this.dbCol(tsKey))}`;
   }

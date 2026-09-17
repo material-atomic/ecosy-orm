@@ -75,7 +75,7 @@ logs.length = 0;
 await createRepository(Features).syncSchema();
 eq("the row for the missing plan is not there", (await one(`SELECT count(*)::int AS n FROM plan_features WHERE plan_id = 'legacy'`)).n, 0);
 eq("the rest of the batch still goes in", (await one(`SELECT value FROM plan_features WHERE plan_id = 'team' AND feature = 'seats'`))?.value, 10);
-eq("…and the skip is counted in the log", said(/seed:plan_features: inserted 1 row into plan_features; 1 skipped, parent missing/), true);
+eq("…and the skip is logged, naming the row", said(/seed:plan_features: skipped 1 row whose parent is missing — row \d+: planId = legacy has no plans\(id\)/), true);
 
 section("mistakes stop the sync, and name themselves");
 class Typo extends Entity.create("plans", planSchema) {
@@ -156,5 +156,79 @@ await tags.delete({ id: "a" });
 await tags.syncSchema();
 eq("the soft-deleted row is not brought back, nor inserted twice",
   (await all(`SELECT id, deleted_at IS NOT NULL AS deleted FROM sd_tags ORDER BY id`)).map((r) => `${r.id}:${r.deleted}`), ["a:true", "b:false"]);
+
+section("A1: an upper-case UUID key — equal to the lower-case one the table stores");
+const UPPER = "0F8E4A6C-2B1D-4C3E-9A7B-5D6E7F8A9B0C";
+class Accounts extends Entity.create("sd_accounts", {
+  columns: { id: { type: "UUID", primaryKey: true, notNull: true }, label: { type: "TEXT" } },
+}) {
+  static effects = [Seeder(Accounts, [{ id: UPPER, label: "hệ thống" }])];
+}
+await createRepository(Accounts).syncSchema();
+await rejects("boot 2 does not insert it again", async () => { await createRepository(Accounts).syncSchema(); throw new Error("booted"); }, /^booted$/);
+eq("…and the table holds it once", (await one(`SELECT count(*)::int AS n FROM sd_accounts`)).n, 1);
+
+class CaseTwice extends Entity.create("sd_accounts", {
+  columns: { id: { type: "UUID", primaryKey: true, notNull: true }, label: { type: "TEXT" } },
+}) {
+  static effects = [Seeder(CaseTwice, [{ id: "11111111-1111-4111-8111-11111111111A" }, { id: "11111111-1111-4111-8111-11111111111a" }], { name: "seed-case-twice" })];
+}
+await rejects("two seed keys that differ only in case are one key", () => createRepository(CaseTwice).syncSchema(), /two rows share the key .* rows 0 and 1, equal as the database compares them/);
+
+section("A2: a key column with a transformer — looked up as it is written");
+const upper = { to: (v) => String(v).toUpperCase(), from: (v) => String(v).toLowerCase() };
+class Codes extends Entity.create("sd_codes", {
+  columns: {
+    id: { type: "UUID", primaryKey: true, notNull: true, default: "gen_random_uuid()" },
+    code: { type: "TEXT", unique: true, notNull: true, transformer: upper },
+  },
+}) {
+  static effects = [Seeder(Codes, [{ code: "abc" }, { code: "xyz" }], { key: ["code"] })];
+}
+await createRepository(Codes).syncSchema();
+await rejects("boot 2 finds both rows", async () => { await createRepository(Codes).syncSchema(); throw new Error("booted"); }, /^booted$/);
+eq("…stored through the transformer, once each", (await all(`SELECT code FROM sd_codes ORDER BY code`)).map((r) => r.code), ["ABC", "XYZ"]);
+
+section("a foreign key written in upper case still finds its parent");
+const PARENT = "22222222-2222-4222-8222-22222222222b";
+class Owners extends Entity.create("sd_owners", { columns: { id: { type: "UUID", primaryKey: true, notNull: true } } }) {
+  static effects = [Seeder(Owners, [{ id: PARENT }])];
+}
+class Pets extends Entity.create("sd_pets", {
+  columns: {
+    id: { type: "TEXT", primaryKey: true, notNull: true },
+    ownerId: { type: "UUID", name: "owner_id", references: "sd_owners(id)" },
+  },
+}) {
+  static effects = [Seeder(Pets, [{ id: "rex", ownerId: PARENT.toUpperCase() }])];
+}
+await createRepository(Owners).syncSchema();
+await createRepository(Pets).syncSchema();
+eq("the child is inserted, not skipped as parentless", (await one(`SELECT owner_id FROM sd_pets WHERE id = 'rex'`))?.owner_id, PARENT);
+
+section("B: a table that refers to itself — parents from the same seed, whatever their order");
+const warns = [];
+orm.DataSource.logger({ debug() {}, info: (m) => logs.push(String(m)), warn: (m) => { warns.push(String(m)); logs.push(String(m)); }, error: (m) => logs.push(String(m)) });
+const tree = [
+  { id: "leaf", parentId: "branch" },
+  { id: "orphan", parentId: "nowhere" },
+  ...Array.from({ length: 600 }, (_, i) => ({ id: `filler-${i}`, parentId: null })),
+  { id: "branch", parentId: "root" },
+  { id: "root", parentId: null },
+];
+class Categories extends Entity.create("sd_categories", {
+  columns: {
+    id: { type: "TEXT", primaryKey: true, notNull: true },
+    parentId: { type: "TEXT", name: "parent_id", references: "sd_categories(id)" },
+  },
+}) {
+  static effects = [Seeder(Categories, tree, { when: "once", name: "seed-categories" })];
+}
+await createRepository(Categories).syncSchema();
+eq("children listed before their parents, a parent past the first chunk: all in, in one boot",
+  (await all(`SELECT id FROM sd_categories WHERE id IN ('root','branch','leaf') ORDER BY id`)).map((r) => r.id), ["branch", "leaf", "root"]);
+eq("the fillers too", (await one(`SELECT count(*)::int AS n FROM sd_categories WHERE id LIKE 'filler-%'`)).n, 600);
+eq("a row pointing at nothing is left out", (await one(`SELECT count(*)::int AS n FROM sd_categories WHERE id = 'orphan'`)).n, 0);
+eq("…and that is a warning, naming it", warns.some((m) => /skipped 1 row whose parent is missing — row 1: parentId = nowhere points at no row in sd_categories or in this seed/.test(m)), true);
 
 await done();
