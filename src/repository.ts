@@ -1,4 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { atCallSite } from "./observe";
 import type { PartialInput, Writable, WriteInput } from "./optional";
 import type { Entity as BaseEntity, EntityConstructor, HookContext } from "./entity";
 import { DataSource } from "./data-source";
@@ -639,4 +640,18 @@ export abstract class Repository<Entity extends BaseEntity> {
       : await run(this);
     return isArray ? rows : (rows[0] ?? null);
   }
+}
+
+/* Each public method remembers where the application called it, for the statements it runs (observe.ts): the
+   caller of `return repo.find(…)` is no longer on the stack by the time the driver runs the statement. Free while
+   nothing observes. */
+for (const name of ["find", "findOne", "insert", "update", "delete", "restore", "upsert"] as const) {
+  const method = Repository.prototype[name] as (...args: unknown[]) => unknown;
+  Object.defineProperty(Repository.prototype, name, {
+    configurable: true,
+    writable: true,
+    value: function (this: unknown, ...args: unknown[]) {
+      return atCallSite(() => method.apply(this, args));
+    },
+  });
 }

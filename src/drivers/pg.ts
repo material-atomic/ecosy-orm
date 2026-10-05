@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { currentLogger } from "../logger";
+import { observed } from "../observe";
 import type { PoolConfig } from "pg";
 import type { PartialInput } from "../optional";
 import type {
@@ -424,8 +425,10 @@ export function PgDriver(config: PgDriverConfig): Driver {
     },
 
     async query<Row = any>(sql: string, params?: unknown[]): Promise<QueryResultLike<Row>> {
-      const result = await pool().query(sql, params);
-      return { rows: result.rows, rowCount: result.rowCount ?? 0 };
+      return observed(sql, params, "pool", async () => {
+        const result = await pool().query(sql, params);
+        return { rows: result.rows, rowCount: result.rowCount ?? 0 };
+      });
     },
 
     async acquire(): Promise<DriverConnection> {
@@ -433,8 +436,10 @@ export function PgDriver(config: PgDriverConfig): Driver {
 
       return {
         async query<Row = any>(sql: string, params?: unknown[]): Promise<QueryResultLike<Row>> {
-          const result = await client.query(sql, params);
-          return { rows: result.rows, rowCount: result.rowCount ?? 0 };
+          return observed(sql, params, "client", async () => {
+            const result = await client.query(sql, params);
+            return { rows: result.rows, rowCount: result.rowCount ?? 0 };
+          });
         },
         release: () => client.release(),
       };

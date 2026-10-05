@@ -3,6 +3,7 @@
 import type { EntityConstructor } from "./entity";
 import { Transaction } from "./transaction";
 import { currentLogger, setLogger, type Logger } from "./logger";
+import { observeQueries, type QueryObserver } from "./observe";
 import type { Driver, QueryResultLike } from "./drivers/types";
 import { currentDriver, setDriver } from "./drivers/current";
 import { refuseInsideEffect } from "./sync-context";
@@ -37,6 +38,19 @@ export class DataSource {
   /** The dialect of the installed driver. */
   static get dialect() {
     return this.current.dialect;
+  }
+
+  /**
+   * Tells `observer` about every statement run from here on: its SQL exactly as sent, its parameters, its time,
+   * its rows, its error, and the application frame that asked for it — for tracing slow queries. See
+   * {@link observeQueries}, which also returns the way to stop.
+   *
+   * @example
+   * DataSource.observe((q) => { if (q.ms >= 500) reportSlow(q); }).entities([User]).initialize(driver);
+   */
+  static observe(observer: QueryObserver): typeof DataSource {
+    observeQueries(observer);
+    return DataSource;
   }
 
   /**

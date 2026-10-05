@@ -10,6 +10,7 @@ export { Seeder, type SeederOptions, type SeedRow, type SeedRows } from "./seede
 export type * from "./drivers/types";
 export * from "./optional";
 export * from "./logger";
+export { observeQueries, type QueryEvent, type QueryObserver } from "./observe";
 
 /* `./migration` is not here, on the same reasoning as the drivers. It reads
    the filesystem — `node:fs/promises`, `node:path` — so exporting it from the
