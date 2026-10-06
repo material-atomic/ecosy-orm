@@ -414,6 +414,15 @@ export function PgDriver(config: PgDriverConfig): Driver {
          decide, and the line says so. */
       currentLogger().info(`[PgDriver] connecting to ${describeTarget(poolConfig)}`);
 
+      /* An idle client the server drops (a restart, a failover, a connection
+         killed by an admin) is reported as an 'error' event on the pool. With
+         no listener Node throws it, and the whole process exits over a
+         connection nothing was using. The pool has already discarded that
+         client and opens a new one on the next query: log it and carry on. */
+      created.on("error", (error: Error) => {
+        currentLogger().error(`[PgDriver] an idle connection was lost: ${error.message}`);
+      });
+
       global[POOL] = created;
     },
 

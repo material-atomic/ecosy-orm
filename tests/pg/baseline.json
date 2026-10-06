@@ -15,5 +15,6 @@
   "sync-modes.test.mjs": 25,
   "sync-types.test.mjs": 24,
   "value-rename.test.mjs": 16,
-  "vector.test.mjs": 31
+  "vector.test.mjs": 31,
+  "pool-errors.test.mjs": 3
 }
